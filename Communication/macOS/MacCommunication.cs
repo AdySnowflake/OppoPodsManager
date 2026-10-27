@@ -304,6 +304,15 @@ internal sealed class MacRfcommConnection : IRawConnection
     // 委托对象指针 → 连接实例，供 Obj-C 回调找到托管侧接收者。
     private static readonly ConcurrentDictionary<IntPtr, MacRfcommConnection> Delegates = new();
 
+    // 已知音频 profile 的 UUID16：探活帧绝不能写进这些通道——往 Hands-Free/A2DP/AVRCP
+    // 写协议垃圾会干扰音频链路（实测导致耳机反复断联）。
+    private static readonly ushort[] AudioProfileUuids = { 0x110A, 0x110B, 0x110E, 0x110F, 0x111E, 0x111F };
+
+    // 扫描失败退避：控制层高频重试（设备列表每 2s 变化、每品牌各试一次），无退避会
+    // 持续骚扰耳机。按设备地址记录最近失败时间，窗口内直接失败不再扫通道。
+    private static readonly ConcurrentDictionary<ulong, DateTime> ScanBackoff = new();
+    private static readonly TimeSpan BackoffWindow = TimeSpan.FromSeconds(10);
+
     private static readonly IntPtr IoBluetoothDeviceClass = ObjGetClass("IOBluetoothDevice");
     private static readonly IntPtr NsThreadClass = ObjGetClass("NSThread");
     private static readonly IntPtr PairedDevicesSelector = SelRegisterName("pairedDevices");
@@ -315,6 +324,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static readonly IntPtr PerformSdpQuerySelector = SelRegisterName("performSDPQuery:");
     private static readonly IntPtr GetServicesSelector = SelRegisterName("getServices");
     private static readonly IntPtr GetRfcommChannelSelector = SelRegisterName("getRFCOMMChannelID:");
+    private static readonly IntPtr MatchesUuid16Selector = SelRegisterName("matchesUUID16:");
     private static readonly IntPtr CountSelector = SelRegisterName("count");
     private static readonly IntPtr ObjectAtIndexSelector = SelRegisterName("objectAtIndex:");
     private static readonly IntPtr OpenChannelSelector = SelRegisterName("openRFCOMMChannelSync:withChannelID:delegate:");
@@ -433,6 +443,16 @@ internal sealed class MacRfcommConnection : IRawConnection
         var opened = _pendingOpened;
         if (opened is null)
             return;
+
+        // 退避窗口内不再重复扫通道（控制层重试频率远高于耳机恢复速度）。
+        if (ScanBackoff.TryGetValue(_address, out var lastFailure) &&
+            DateTime.UtcNow - lastFailure < BackoffWindow)
+        {
+            var exception = new IOException("RFCOMM scan is backing off after a recent failure.");
+            opened.TrySetException(exception);
+            return;
+        }
+
         try
         {
             // 设备对象来自 pairedDevices（withAddress: 创建的游离对象打不开 RFCOMM），已 retain。
@@ -468,11 +488,13 @@ internal sealed class MacRfcommConnection : IRawConnection
             lock (_channelGate)
                 _channel = live;
             Volatile.Write(ref _connected, 1);
+            ScanBackoff.TryRemove(_address, out _);
             opened.TrySetResult();
         }
         catch (Exception exception)
         {
             ApplicationLog.Current?.Error("Bluetooth", "macOS RFCOMM 连接失败。", exception);
+            ScanBackoff[_address] = DateTime.UtcNow;
             await TeardownAsync();
             opened.TrySetException(exception);
         }
@@ -481,13 +503,37 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static List<byte> BuildChannelList(IntPtr device)
     {
         var channels = new List<byte>();
-        foreach (var channelId in QuerySdpRfcommChannels(device))
-            if (!channels.Contains(channelId))
-                channels.Add(channelId);
-        for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
-            if (!channels.Contains((byte)channelId))
+        var services = ObjMsgSend(device, GetServicesSelector);
+        if (services != IntPtr.Zero)
+        {
+            var count = ObjMsgSendCount(services, CountSelector);
+            for (ulong index = 0; index < count; index++)
+            {
+                var record = ObjMsgSendObjectAtIndex(services, ObjectAtIndexSelector, index);
+                if (record == IntPtr.Zero)
+                    continue;
+                if (ObjMsgSendGetRfcommChannel(record, GetRfcommChannelSelector, out var channel) != KIoReturnSuccess || channel == 0)
+                    continue;
+                // 跳过音频 profile 通道，只探活协议类服务（GAIA/SPP/厂商私有）。
+                if (IsAudioProfile(record))
+                    continue;
+                if (!channels.Contains(channel))
+                    channels.Add(channel);
+            }
+        }
+        // 仅当 SDP 没给出任何可用通道时才退回裸通道 1-30 兜底。
+        if (channels.Count == 0)
+            for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
                 channels.Add((byte)channelId);
         return channels;
+    }
+
+    private static bool IsAudioProfile(IntPtr record)
+    {
+        foreach (var uuid in AudioProfileUuids)
+            if (ObjMsgSendBoolArg(record, MatchesUuid16Selector, uuid) != 0)
+                return true;
+        return false;
     }
 
     // 打开指定通道并用两种 GAIA 前导码探活，返回可用于会话的通道。
@@ -847,25 +893,6 @@ internal sealed class MacRfcommConnection : IRawConnection
             ObjMsgSend(obj, ReleaseSelector);
     }
 
-    // 从 SDP 记录里抽取所有 RFCOMM 服务通道（GAIA/SPP 等一定注册在 SDP 上）。
-    private static List<byte> QuerySdpRfcommChannels(IntPtr device)
-    {
-        var channels = new List<byte>();
-        var services = ObjMsgSend(device, GetServicesSelector);
-        if (services == IntPtr.Zero)
-            return channels;
-        var count = ObjMsgSendCount(services, CountSelector);
-        for (ulong index = 0; index < count; index++)
-        {
-            var record = ObjMsgSendObjectAtIndex(services, ObjectAtIndexSelector, index);
-            if (record == IntPtr.Zero)
-                continue;
-            if (ObjMsgSendGetRfcommChannel(record, GetRfcommChannelSelector, out var channel) == KIoReturnSuccess && channel > 0)
-                channels.Add(channel);
-        }
-        return channels;
-    }
-
     private static bool TryOpenChannel(IntPtr device, byte channelId, IntPtr channelDelegate, out IntPtr channel)
     {
         var status = ObjMsgSendOpenChannel(device, OpenChannelSelector, out channel, channelId, channelDelegate);
@@ -1057,6 +1084,10 @@ internal sealed class MacRfcommConnection : IRawConnection
 
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
     private static extern byte ObjMsgSendBool(IntPtr self, IntPtr selector);
+
+    // matchesUUID16: 等带单个整数参数、返回 BOOL 的选择器。
+    [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
+    private static extern byte ObjMsgSendBoolArg(IntPtr self, IntPtr selector, ushort argument);
 
     // performSelectorOnMainThread:withObject:waitUntilDone:
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]

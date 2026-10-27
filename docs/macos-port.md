@@ -187,6 +187,8 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 4. **绝不用 `writeSync:length:`**：它内部会在主线程跑嵌套 run loop 等 socket 可写（`CFWriteStreamWrite → SocketStream::write → CFRunLoopRunSpecific → mach_msg`），对端不读数据时**永久阻塞主线程**（`sample` 实测：2483/2483 样本卡在此处，UI 全冻）。必须用 `writeAsync:length:refcon:` + `rfcommChannelWriteComplete:refcon:status:` 回调；缓冲区用非托管内存，由完成回调释放，等待放后台线程并设超时。
 5. **`openRFCOMMChannelSync` 暂用同步版**：数十次实测均快速返回（成功/失败都不阻塞）；若未来出现打开卡死，按第 4 条同样改造为 `openRFCOMMChannelAsync:`。
 6. **IOBluetooth 返回的对象必须 retain**：`openRFCOMMChannelSync:` 出参、`pairedDevices` 元素都是 **autoreleased** 对象——主线程 run loop 每处理完一个事件就 drain autorelease 池，不 retain 的对象在**下一次派达时已被释放、内存被复用**，之后任何调用都崩（实测 `doesNotRecognizeSelector` → SIGABRT），且会把 blued 会话搞断（表现为蓝牙整体断联）。取得时 retain，关闭时 `closeChannel` + `release` 配对。
+7. **探活帧绝不写音频 profile 通道**：往 Hands-Free(0x111E/0x111F)/A2DP(0x110A/0x110B)/AVRCP(0x110E/0x110F) 写协议垃圾会干扰音频链路，实测导致耳机反复断联。用 `matchesUUID16:` 在 SDP 枚举阶段就排除这些通道。
+8. **控制层重试频率远高于耳机恢复速度**（设备列表每 2s 变化 × 每品牌各试一次），无退避的全通道扫描等于对耳机 DDoS。按设备地址做 10s 失败退避 + 仅扫 SDP 登记的非音频通道（SDP 为空才退回裸 1-30）。
 | `CS0117: 'Path' does not contain a definition for 'Combine'` / `CS0103: 'Directory'/'File' does not exist` | `#if MACOS` 自启块用了裸 `System.IO` 调用。文件里 `Avalonia.Controls.Shapes.Path` 与 `System.IO.Path` 冲突，**不能**直接加 `using System.IO;`，须全限定 `System.IO.*`（文件既有惯例） |
 
 ### 运行期
@@ -198,6 +200,7 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 | UI 卡死 4-6 秒/次 | 连接序列（含秒级等待）整体占主线程；控制层每品牌重试 | 日志时间戳（每次尝试间隔 4-6s） |
 | **UI 永久卡死（主线程 100% 占用）** | `writeSync:length:` 在主线程嵌套 run loop 里等 socket 可写，对端不读即永久阻塞（`mach_msg`） | `sample <pid> 3`：主线程栈停在 `-[IOBluetoothRFCOMMChannel writeSync:length:] → CFWriteStreamWrite → mach_msg` |
 | 所有通道打开返回 `0xE00002D6` (kIOReturnTimeout) | 耳机被反复探活后进入拒绝状态，需静置恢复 | C 原型逐通道打印 status |
+| 耳机音频链路反复断联（但 ACL 仍连接） | 探活帧写进了 Hands-Free/A2DP 等音频 profile 通道 | `matchesUUID16:` 枚举阶段排除音频 profile 后恢复 |
 | **主线程 `performSelectorOnMainThread` 回调内 EXC_BAD_ACCESS（SIGSEGV）** | delegate 被 release 后派发仍在主线程队列中 → use-after-free | `~/Library/Logs/DiagnosticReports/*.ips`（崩溃线程 0，栈含 `__NSThreadPerformPerform`） |
 | **SIGABRT + `doesNotRecognizeSelector`，且蓝牙整体断联** | IOBluetooth 返回的 autoreleased 对象未 retain，被 run loop 的 autorelease 池回收后内存复用 | `*.ips` 栈含 `objc_exception_throw → doesNotRecognizeSelector → _CF_forwarding_prep_0` |
 | 单通道探活写失败（`0xE00002CD` kIOReturnNotOpen）导致整个序列中止 | 异常直接穿透到序列 catch，未按“死通道”处理 | 日志堆栈 |
