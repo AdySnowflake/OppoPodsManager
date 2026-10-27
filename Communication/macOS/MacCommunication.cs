@@ -258,8 +258,8 @@ internal sealed class MacRfcommConnection : IRawConnection
     // IOBluetooth 委托回调投递到打开通道的线程，该线程必须持续抽取 run loop，否则收不到数据。
     private static readonly IntPtr DefaultRunLoopMode = CreateRunLoopMode();
 
-    private static readonly ChannelDataImp ChannelDataCallback = OnChannelData;
-    private static readonly ChannelClosedImp ChannelClosedCallback = OnChannelClosed;
+    private static readonly RfcommDataImp ChannelDataCallback = OnChannelData;
+    private static readonly RfcommClosedImp ChannelClosedCallback = OnChannelClosed;
     private static readonly IntPtr ChannelDataImp = Marshal.GetFunctionPointerForDelegate(ChannelDataCallback);
     private static readonly IntPtr ChannelClosedImp = Marshal.GetFunctionPointerForDelegate(ChannelClosedCallback);
     private static readonly IntPtr DelegateClass = CreateDelegateClass();
@@ -608,10 +608,10 @@ internal sealed class MacRfcommConnection : IRawConnection
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate void ChannelDataImp(IntPtr self, IntPtr selector, IntPtr channel, IntPtr data, IntPtr length);
+    private delegate void RfcommDataImp(IntPtr self, IntPtr selector, IntPtr channel, IntPtr data, IntPtr length);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    private delegate void ChannelClosedImp(IntPtr self, IntPtr selector, IntPtr channel);
+    private delegate void RfcommClosedImp(IntPtr self, IntPtr selector, IntPtr channel);
 
     [DllImport(LibObjc, EntryPoint = "objc_getClass", CharSet = CharSet.Ansi)]
     private static extern IntPtr ObjGetClass(string name);
