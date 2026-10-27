@@ -129,36 +129,57 @@ public sealed class MacBluetoothDiscovery : IDeviceDiscoveryMonitor
                 continue;
             foreach (var property in entry.EnumerateObject())
             {
-                if (!property.Name.Equals("device_connected", StringComparison.OrdinalIgnoreCase) ||
-                    property.Value.ValueKind != JsonValueKind.Object)
+                if (!property.Name.Equals("device_connected", StringComparison.OrdinalIgnoreCase))
                     continue;
-
-                foreach (var device in property.Value.EnumerateObject())
+                // 不同 macOS 版本的序列化形态不同：既可能是 { "设备名": {...} } 的对象，
+                // 也可能是 [ { "设备名": {...} } ] 的数组（实测 Darwin 24 为后者）。
+                switch (property.Value.ValueKind)
                 {
-                    var name = device.Name;
-                    if (!device.Value.TryGetProperty("device_address", out var addressElement))
-                        continue;
-                    var addressText = addressElement.GetString();
-                    if (string.IsNullOrWhiteSpace(addressText) || !TryParseAddress(addressText, out var address))
-                        continue;
-
-                    var hex = address.ToString("X12", CultureInfo.InvariantCulture);
-                    result.Add(new DeviceCandidate(
-                        hex,
-                        hex,
-                        hex,
-                        name,
-                        ParseServiceIds(device.Value),
-                        [MacConnectionFactory.TransportName]));
+                    case JsonValueKind.Object:
+                        AddDevices(property.Value, result);
+                        break;
+                    case JsonValueKind.Array:
+                        foreach (var group in property.Value.EnumerateArray())
+                        {
+                            if (group.ValueKind == JsonValueKind.Object)
+                                AddDevices(group, result);
+                        }
+                        break;
                 }
             }
         }
 
-        return result
+        var candidates = result
             .GroupBy(candidate => candidate.StableId, StringComparer.Ordinal)
             .Select(group => group.First())
             .OrderBy(candidate => candidate.DisplayName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        if (candidates.Length > 0)
+            ApplicationLog.Current?.Debug("Bluetooth", $"macOS 已连接设备：{string.Join("、", candidates.Select(candidate => candidate.DisplayName))}");
+        return candidates;
+    }
+
+    // device_connected 的每个条目是 "设备名" → { device_address, device_services, ... } 的映射。
+    private static void AddDevices(JsonElement container, List<DeviceCandidate> result)
+    {
+        foreach (var device in container.EnumerateObject())
+        {
+            var name = device.Name;
+            if (!device.Value.TryGetProperty("device_address", out var addressElement))
+                continue;
+            var addressText = addressElement.GetString();
+            if (string.IsNullOrWhiteSpace(addressText) || !TryParseAddress(addressText, out var address))
+                continue;
+
+            var hex = address.ToString("X12", CultureInfo.InvariantCulture);
+            result.Add(new DeviceCandidate(
+                hex,
+                hex,
+                hex,
+                name,
+                ParseServiceIds(device.Value),
+                [MacConnectionFactory.TransportName]));
+        }
     }
 
     // device_services 形如 "0x1101 < HFP AVRCP A2DP GATT ACL >"，抽取 16/32 位 UUID 还原成完整 GUID。
