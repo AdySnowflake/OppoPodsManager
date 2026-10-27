@@ -413,12 +413,12 @@ internal sealed class MacRfcommConnection : IRawConnection
 
             // SDP 登记的 RFCOMM 通道优先（GAIA 等服务一定注册在 SDP 上），裸通道 1-30 兜底。
             var channels = new List<byte>();
-            foreach (var channel in QuerySdpRfcommChannels(device))
-                if (!channels.Contains(channel))
-                    channels.Add(channel);
-            for (var channel = 1; channel <= MaxRfcommChannel; channel++)
-                if (!channels.Contains((byte)channel))
-                    channels.Add((byte)channel);
+            foreach (var channelId in QuerySdpRfcommChannels(device))
+                if (!channels.Contains(channelId))
+                    channels.Add(channelId);
+            for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
+                if (!channels.Contains((byte)channelId))
+                    channels.Add((byte)channelId);
             if (channels.Count > 0)
                 ApplicationLog.Current?.Debug("Bluetooth", $"RFCOMM 候选通道：{string.Join(",", channels.Select(c => c.ToString(CultureInfo.InvariantCulture)))}");
 

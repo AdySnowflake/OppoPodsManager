@@ -166,7 +166,8 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 
 | 现象 | 原因 |
 |---|---|
-| `CS0102: already contains a definition for 'ChannelDataImp'` | delegate 类型与 IntPtr 字段同名。类型改名 `RfcommDataImp`/`RfcommClosedImp` |
+| `CS0102: already contains a definition for 'ChannelDataImp'` | delegate 类型与 IntPtr 字段同名。类型改名 `RfcommDataImp`/`RfcommClosedImp`/`RfcommSdpCompleteImp` |
+| `CS0136: A local or parameter named 'channel' cannot be declared in this scope` | C# 的 for/foreach 迭代变量作用域覆盖整个外层块，与后续 `IntPtr channel` 声明冲突。循环变量改名 `channelId` |
 | 局部变量与方法参数同名（`out var opened` vs `opened`） | C# 不允许，循环内改名 `openedChannel` |
 | `CS0117: 'Path' does not contain a definition for 'Combine'` / `CS0103: 'Directory'/'File' does not exist` | `#if MACOS` 自启块用了裸 `System.IO` 调用。文件里 `Avalonia.Controls.Shapes.Path` 与 `System.IO.Path` 冲突，**不能**直接加 `using System.IO;`，须全限定 `System.IO.*`（文件既有惯例） |
 
