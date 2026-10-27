@@ -62,7 +62,9 @@ int fd = socket(31 /* AF_BLUETOOTH */, SOCK_STREAM, BTPROTO_RFCOMM);
 
 同一个通道、同一 SDP 完成状态下，主线程打开成功、后台线程立即失败。**这不是“开通道的线程”，而是“必须是主线程”**——后台线程上 SDP 查询看似成功（调用返回 0、`getServices` 还能读到系统缓存），但回调不投递、查询实际未完成，后续打开必然全败。
 
-实现：连接序列（SDP + 开通道 + 探活）、写入、关闭全部经 `performSelectorOnMainThread:withObject:waitUntilDone:` 派发到主线程；等待应答时在主线程回调内用**嵌套** `CFRunLoopRunInMode` 抽取。稳态下数据回调由主线程已有的 run loop（Avalonia 主循环）天然投递，无需自建线程。
+实现：**调用与等待分离**——每个 IOBluetooth 调用（开通道/关通道/写/SDP 发起）经 `performSelectorOnMainThread:withObject:waitUntilDone:` 单独派发到主线程执行（微秒级，主线程不被占）；SDP 回调、探活数据的**等待**全部在后台线程进行（回调经主线程 run loop 到达后置位 `TaskCompletionSource`）。稳态数据回调同样由主线程 run loop 天然投递，无需自建线程。
+
+> 反面教材：早期实现把整个连接序列（含 30 通道 × 800ms 探活）搬上主线程，控制层每品牌重试一次 → UI 每次卡死 4-6 秒。**主线程只能做微秒级调用，绝不能做秒级等待。**
 
 ### 3.4 通道优先级：SDP 登记通道优先，裸通道兜底
 

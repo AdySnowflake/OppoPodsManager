@@ -261,18 +261,18 @@ public sealed class MacConnectionFactory : IConnectionFactory
 
 // macOS RFCOMM 原始连接：经 objc runtime 调用 IOBluetooth 框架。
 //
-// 两个平台硬约束（均真机实测，详见 docs/macos-port.md）：
+// 三条平台硬约束（均真机实测，详见 docs/macos-port.md）：
 //   1. macOS 的 BSD socket 层没有 AF_BLUETOOTH（socket() 返回 EAFNOSUPPORT），
-//      经典蓝牙 RFCOMM 只能走 IOBluetooth，与 Linux 的 BlueZ socket 路径完全不同。
-//   2. IOBluetooth 的 SDP 回调投递与 RFCOMM 通道打开都要求在主线程执行：
-//      后台线程上 performSDPQuery 回调永不投递、openRFCOMMChannelSync 直接返回
-//      kIOReturnError(0xE00002BC)。因此整个连接序列（SDP + 开通道 + 探活）以及
-//      后续写入都经 performSelectorOnMainThread 派发到主线程；数据回调则由
-//      主线程已有的 run loop（Avalonia 主循环）天然投递。
+//      经典蓝牙 RFCOMM 只能走 IOBluetooth。
+//   2. IOBluetooth 的调用必须在主线程发起：后台线程上 performSDPQuery 的回调永不投递、
+//      openRFCOMMChannelSync 全部返回 kIOReturnError(0xE00002BC)（对照实验：同通道同状态下
+//      主线程成功、后台线程失败）。
+//   3. 但等待不能占着主线程：SDP 回调、探活数据的等待都在后台线程进行（回调经主线程
+//      run loop 到达后置位 TaskCompletionSource）。因此每个 IOBluetooth 调用经
+//      performSelectorOnMainThread 单独派发（微秒级），主线程永不被长时阻塞。
 internal sealed class MacRfcommConnection : IRawConnection
 {
     private const string LibObjc = "/usr/lib/libobjc.dylib";
-    private const string CoreFoundation = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
     private const int KIoReturnSuccess = 0;
     private const int MaxRfcommChannel = 30;
     private const int ProbeTimeoutMs = 400;
@@ -286,9 +286,6 @@ internal sealed class MacRfcommConnection : IRawConnection
     // 必须重开通道再发 vivo 格式帧，否则会误杀唯一的活通道。
     private static readonly byte[] OppoProbeFrame = { 0xAA, 0x07, 0x00, 0x00, 0x03, 0x01, 0xF0, 0x00, 0x00 };
     private static readonly byte[] VivoProbeFrame = { 0xFF, 0x04, 0x00, 0x00, 0x00, 0x1B, 0x02, 0x07 };
-
-    // 嵌套 run loop 模式串：在主线程回调内部抽取，用于等待 SDP/探活应答。
-    private static readonly IntPtr DefaultRunLoopMode = CreateRunLoopMode();
 
     private static readonly RfcommDataImp ChannelDataCallback = OnChannelData;
     private static readonly RfcommClosedImp ChannelClosedCallback = OnChannelClosed;
@@ -310,9 +307,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static readonly IntPtr Utf8StringSelector = SelRegisterName("UTF8String");
     private static readonly IntPtr IsMainThreadSelector = SelRegisterName("isMainThread");
     private static readonly IntPtr PerformOnMainSelector = SelRegisterName("performSelectorOnMainThread:withObject:waitUntilDone:");
-    private static readonly IntPtr RunSequenceSelector = SelRegisterName("runConnectionSequence:");
-    private static readonly IntPtr RunWriteSelector = SelRegisterName("runWrite:");
-    private static readonly IntPtr RunCloseSelector = SelRegisterName("runClose:");
+    private static readonly IntPtr RunActionSelector = SelRegisterName("runAction:");
     private static readonly IntPtr PerformSdpQuerySelector = SelRegisterName("performSDPQuery:");
     private static readonly IntPtr GetServicesSelector = SelRegisterName("getServices");
     private static readonly IntPtr GetRfcommChannelSelector = SelRegisterName("getRFCOMMChannelID:");
@@ -328,8 +323,9 @@ internal sealed class MacRfcommConnection : IRawConnection
 
     private readonly DeviceCandidate _candidate;
     private readonly object _channelGate = new();
-    private readonly object _writeGate = new();
+    private readonly SemaphoreSlim _mainSemaphore = new(1, 1);
 
+    private ulong _address;
     private IntPtr _device;
     private IntPtr _channel;
     private IntPtr _delegate;
@@ -337,10 +333,11 @@ internal sealed class MacRfcommConnection : IRawConnection
     private int _disposed;
     private volatile bool _stopRequested;
     private TaskCompletionSource? _pendingOpened;
+    private Task? _sequenceTask;
     private TaskCompletionSource<byte[]>? _probeResponse;
-    private TaskCompletionSource? _sdpCompletion;
-    private byte[]? _pendingWrite;
-    private TaskCompletionSource? _pendingWriteCompletion;
+    private TaskCompletionSource<bool>? _sdpCompletion;
+    private Action? _mainAction;
+    private TaskCompletionSource? _mainCompletion;
 
     public MacRfcommConnection(DeviceCandidate candidate)
     {
@@ -357,19 +354,14 @@ internal sealed class MacRfcommConnection : IRawConnection
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if (!ulong.TryParse(_candidate.BluetoothAddress, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address))
             throw new InvalidOperationException("RFCOMM requires a Bluetooth address.");
-
-        // 设备对象来自 pairedDevices（withAddress: 创建的游离对象打不开 RFCOMM）。
-        var device = FindPairedDevice(address);
-        if (device == IntPtr.Zero)
-            throw new IOException("The paired device was not found.");
-        _device = device;
+        _address = address;
 
         _delegate = CreateDelegate(this);
         _pendingOpened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        // 连接序列派发到主线程执行（IOBluetooth 的硬约束，见类注释）。
-        // waitUntilDone 会阻塞调用方线程直至主线程跑完，故包一层 Task.Run。
-        await Task.Run(() => DispatchToMain(RunSequenceSelector), cancellationToken);
+        // 连接序列在后台线程协调：每个 IOBluetooth 调用单独派发到主线程，等待在后台进行。
+        var sequence = RunSequenceAsync();
+        _sequenceTask = sequence;
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(ConnectTimeoutSeconds));
@@ -379,9 +371,10 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
         catch
         {
-            // 主线程可能仍在扫描，通知其中止后短暂等待，避免通道刚打开就被遗留。
+            // 序列可能仍在扫描，通知其中止并等待其收尾，避免通道刚打开就被遗留。
             _stopRequested = true;
-            await Task.Delay(TimeSpan.FromMilliseconds(600), CancellationToken.None);
+            try { await sequence.WaitAsync(TimeSpan.FromSeconds(3)); }
+            catch { /* 序列自身的异常已由 _pendingOpened 承载 */ }
             throw;
         }
     }
@@ -391,38 +384,22 @@ internal sealed class MacRfcommConnection : IRawConnection
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         if (Volatile.Read(ref _connected) == 0)
             throw new IOException("The RFCOMM channel is not open.");
-
-        if (IsMainThread())
-        {
-            WriteCurrentChannel(data.ToArray());
-            return;
-        }
-
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (_writeGate)
-        {
-            _pendingWrite = data.ToArray();
-            _pendingWriteCompletion = completion;
-        }
-        try
-        {
-            await Task.Run(() => DispatchToMain(RunWriteSelector), cancellationToken);
-            await completion.Task.WaitAsync(cancellationToken);
-        }
-        finally
-        {
-            lock (_writeGate)
-            {
-                _pendingWrite = null;
-                _pendingWriteCompletion = null;
-            }
-        }
+        var payload = data.ToArray();
+        await RunOnMainAsync(() => WriteCurrentChannel(payload));
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken)
     {
         _stopRequested = true;
         var wasConnected = Interlocked.Exchange(ref _connected, 0) != 0;
+
+        // 等待进行中的连接序列收尾，避免与其竞争主线程派发或提前释放委托。
+        if (_sequenceTask is not null)
+        {
+            try { await _sequenceTask.WaitAsync(TimeSpan.FromSeconds(3)); }
+            catch { /* 序列异常已在连接路径处理 */ }
+        }
+
         IntPtr channel;
         IntPtr channelDelegate;
         lock (_channelGate)
@@ -432,17 +409,14 @@ internal sealed class MacRfcommConnection : IRawConnection
             channelDelegate = _delegate;
             _delegate = IntPtr.Zero;
         }
-
         if (channel != IntPtr.Zero)
         {
-            // 关闭同样派发到主线程：后台线程上的 IOBluetooth 操作不可靠，
-            // 且泄漏的 RFCOMM 通道会被对端保留、阻塞下次连接。
-            if (IsMainThread())
-                CloseChannel(channel);
-            else
-                await Task.Run(() => DispatchToMain(RunCloseSelector), CancellationToken.None);
+            try { await RunOnMainAsync(() => CloseChannel(channel)); }
+            catch (Exception exception)
+            {
+                ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
+            }
         }
-
         if (channelDelegate != IntPtr.Zero)
         {
             Delegates.TryRemove(channelDelegate, out _);
@@ -459,46 +433,44 @@ internal sealed class MacRfcommConnection : IRawConnection
         await DisconnectAsync(CancellationToken.None);
     }
 
-    // ===== 主线程序列（经 performSelectorOnMainThread 派发） =====
+    // ===== 连接序列（后台协调 + 主线程调用） =====
 
-    private void RunSequence()
+    private async Task RunSequenceAsync()
     {
         var opened = _pendingOpened;
         if (opened is null)
             return;
         try
         {
+            // 设备对象来自 pairedDevices（withAddress: 创建的游离对象打不开 RFCOMM）。
+            var device = await RunOnMainAsync(() => FindPairedDevice(_address));
+            if (device == IntPtr.Zero)
+                throw new IOException("The paired device was not found.");
+            _device = device;
+
             // IOBluetooth 打开 RFCOMM 前必须先完成一次 SDP 查询：未查询时所有通道都返回
             // kIOReturnError(0xE00002BC)，实测与 delegate/设备对象形态无关。
-            if (!PerformSdpQuery(_device))
+            if (!await PerformSdpQueryAsync())
                 ApplicationLog.Current?.Debug("Bluetooth", "SDP 查询未在预算内完成，按裸通道继续。");
 
             // SDP 登记的 RFCOMM 通道优先（GAIA 等服务一定注册在 SDP 上），裸通道 1-30 兜底。
-            var channels = new List<byte>();
-            foreach (var channelId in QuerySdpRfcommChannels(_device))
-                if (!channels.Contains(channelId))
-                    channels.Add(channelId);
-            for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
-                if (!channels.Contains((byte)channelId))
-                    channels.Add((byte)channelId);
+            var channels = await RunOnMainAsync(() => BuildChannelList(device));
             ApplicationLog.Current?.Debug("Bluetooth", $"RFCOMM 候选通道：{string.Join(",", channels.Select(c => c.ToString(CultureInfo.InvariantCulture)))}");
 
-            IntPtr channel = IntPtr.Zero;
+            IntPtr live = IntPtr.Zero;
             foreach (var id in channels)
             {
                 if (_stopRequested)
                     break;
-                if (TryActivateChannel(_device, id, out var activated))
-                {
-                    channel = activated;
+                live = await TryActivateChannelAsync(device, id);
+                if (live != IntPtr.Zero)
                     break;
-                }
             }
-            if (channel == IntPtr.Zero || _stopRequested)
+            if (live == IntPtr.Zero || _stopRequested)
                 throw new IOException("No RFCOMM channel is available.");
 
             lock (_channelGate)
-                _channel = channel;
+                _channel = live;
             Volatile.Write(ref _connected, 1);
             opened.TrySetResult();
         }
@@ -510,101 +482,97 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
     }
 
-    // 主线程写入：数据由 SendAsync 通过 _pendingWrite 传入。
-    private void RunWrite()
+    private static List<byte> BuildChannelList(IntPtr device)
     {
-        byte[]? data;
-        TaskCompletionSource? completion;
-        lock (_writeGate)
-        {
-            data = _pendingWrite;
-            completion = _pendingWriteCompletion;
-        }
-        if (data is null || completion is null)
-            return;
-        try
-        {
-            WriteCurrentChannel(data);
-            completion.TrySetResult();
-        }
-        catch (Exception exception)
-        {
-            completion.TrySetException(exception);
-            _stopRequested = true;
-        }
+        var channels = new List<byte>();
+        foreach (var channelId in QuerySdpRfcommChannels(device))
+            if (!channels.Contains(channelId))
+                channels.Add(channelId);
+        for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
+            if (!channels.Contains((byte)channelId))
+                channels.Add((byte)channelId);
+        return channels;
     }
-
-    // 主线程关闭当前通道。
-    private void RunClose()
-    {
-        IntPtr channel;
-        lock (_channelGate)
-        {
-            channel = _channel;
-            _channel = IntPtr.Zero;
-        }
-        if (channel != IntPtr.Zero)
-            CloseChannel(channel);
-    }
-
-    // ===== 通道探活 =====
 
     // 打开指定通道并用两种 GAIA 前导码探活，返回可用于会话的通道。
-    private bool TryActivateChannel(IntPtr device, byte channelId, out IntPtr activated)
+    private async Task<IntPtr> TryActivateChannelAsync(IntPtr device, byte channelId)
     {
-        activated = IntPtr.Zero;
-        if (!TryOpenChannel(device, channelId, _delegate, out var channel))
-            return false;
+        var channel = await OpenChannelOnMainAsync(device, channelId);
+        if (channel == IntPtr.Zero)
+            return IntPtr.Zero;
 
         // 第一轮：OPPO 格式。OPPO/OnePlus/realme 及部分华为/小米设备直接应答。
-        if (ProbeOnce(channel, OppoProbeFrame, ProbeTimeoutMs))
-        {
-            activated = channel;
-            return true;
-        }
+        if (await ProbeOnceAsync(channel, OppoProbeFrame, ProbeTimeoutMs))
+            return channel;
 
         // 第二轮：换 vivo 格式。vivo 耳机被 0xAA 帧毒化后通道已关闭，需重开再试；
         // 对仍然打开但沉默的通道（TEST/KTV 等服务）也再补一枪，成本仅一次探测超时。
-        if (!IsChannelOpen(channel))
+        if (!await IsChannelOpenAsync(channel))
         {
-            CloseChannel(channel);
-            if (!TryOpenChannel(device, channelId, _delegate, out channel))
-                return false;
+            await CloseChannelOnMainAsync(channel);
+            channel = await OpenChannelOnMainAsync(device, channelId);
+            if (channel == IntPtr.Zero)
+                return IntPtr.Zero;
         }
-        if (ProbeOnce(channel, VivoProbeFrame, ProbeTimeoutMs))
-        {
-            activated = channel;
-            return true;
-        }
+        if (await ProbeOnceAsync(channel, VivoProbeFrame, ProbeTimeoutMs))
+            return channel;
 
-        CloseChannel(channel);
-        return false;
+        await CloseChannelOnMainAsync(channel);
+        return IntPtr.Zero;
     }
 
     // 发送一帧探活数据并等待应答：首字节为 GAIA 前导码（0xAA/0xFF）即视为活通道。
     // 应答数据由 HandleData 交给探活等待者，不进入 DataReceived，由上层按需重新查询。
-    private bool ProbeOnce(IntPtr channel, byte[] frame, int timeoutMs)
+    private async Task<bool> ProbeOnceAsync(IntPtr channel, byte[] frame, int timeoutMs)
     {
         var response = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _probeResponse = response;
+        Interlocked.Exchange(ref _probeResponse, response);
         try
         {
-            WriteRaw(channel, frame);
-            var deadline = Stopwatch.StartNew();
-            while (!response.Task.IsCompleted && deadline.ElapsedMilliseconds < timeoutMs)
-                PumpRunLoop(0.05);
-            if (!response.Task.IsCompleted)
-                return false;
+            await RunOnMainAsync(() => WriteRaw(channel, frame));
+            using var timeout = new CancellationTokenSource(timeoutMs);
+            await response.Task.WaitAsync(timeout.Token);
             var data = response.Task.Result;
             return data.Length > 0 && (data[0] == 0xAA || data[0] == 0xFF);
         }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
         finally
         {
-            _probeResponse = null;
+            Interlocked.Exchange(ref _probeResponse, null);
         }
     }
 
-    // ===== 数据与状态回调（主线程） =====
+    // 主线程发起 SDP 查询，后台等待其完成回调。
+    private async Task<bool> PerformSdpQueryAsync()
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _sdpCompletion = completion;
+        try
+        {
+            await RunOnMainAsync(() =>
+            {
+                var status = ObjMsgSendSdpQuery(_device, PerformSdpQuerySelector, _delegate);
+                if (status != KIoReturnSuccess)
+                    completion.TrySetResult(false);
+            });
+            using var timeout = new CancellationTokenSource(SdpTimeoutMs);
+            await completion.Task.WaitAsync(timeout.Token);
+            return completion.Task.Result;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _sdpCompletion, null);
+        }
+    }
+
+    // ===== 回调（主线程） =====
 
     private void HandleData(IntPtr data, int length)
     {
@@ -639,10 +607,81 @@ internal sealed class MacRfcommConnection : IRawConnection
 
     private void HandleSdpComplete()
     {
-        _sdpCompletion?.TrySetResult();
+        _sdpCompletion?.TrySetResult(true);
     }
 
-    // ===== 辅助 =====
+    // ===== 主线程派发 =====
+
+    // 在主线程执行一个 IOBluetooth 调用并等待其返回。调用本身必须是微秒级的
+    // （不做等待/抽取），长时等待由调用方在后台线程进行。
+    private async Task RunOnMainAsync(Action action)
+        => await RunOnMainAsync(() => { action(); return true; });
+
+    private async Task<T> RunOnMainAsync<T>(Func<T> function)
+    {
+        if (IsMainThread())
+            return function();
+
+        await _mainSemaphore.WaitAsync();
+        try
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            T result = default!;
+            lock (_channelGate)
+            {
+                // 调用在主线程执行；异常由 RunAction 捕获后经 completion 传回。
+                _mainAction = () => { result = function(); };
+                _mainCompletion = completion;
+            }
+            // waitUntilDone:YES：本线程阻塞至主线程执行完该调用（调用不等待，故阻塞极短）。
+            await Task.Run(() =>
+                ObjMsgSendPerformOnMain(_delegate, PerformOnMainSelector, RunActionSelector, IntPtr.Zero, 1));
+            await completion.Task;
+            return result;
+        }
+        finally
+        {
+            _mainSemaphore.Release();
+        }
+    }
+
+    // 主线程选择器回调：执行 _mainAction 中登记的调用。
+    private void RunAction()
+    {
+        Action? action;
+        TaskCompletionSource? completion;
+        lock (_channelGate)
+        {
+            action = _mainAction;
+            completion = _mainCompletion;
+            _mainAction = null;
+            _mainCompletion = null;
+        }
+        if (action is null)
+            return;
+        try
+        {
+            action();
+            completion?.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            completion?.TrySetException(exception);
+        }
+    }
+
+    private async Task<IntPtr> OpenChannelOnMainAsync(IntPtr device, byte channelId)
+    {
+        var channel = IntPtr.Zero;
+        await RunOnMainAsync(() => TryOpenChannel(device, channelId, _delegate, out channel));
+        return channel;
+    }
+
+    private async Task CloseChannelOnMainAsync(IntPtr channel)
+        => await RunOnMainAsync(() => CloseChannel(channel));
+
+    private async Task<bool> IsChannelOpenAsync(IntPtr channel)
+        => await RunOnMainAsync(() => IsChannelOpen(channel));
 
     private void WriteCurrentChannel(byte[] data)
     {
@@ -666,13 +705,21 @@ internal sealed class MacRfcommConnection : IRawConnection
             _delegate = IntPtr.Zero;
         }
         if (channel != IntPtr.Zero)
-            CloseChannel(channel);
+        {
+            try { RunOnMainAsync(() => CloseChannel(channel)).GetAwaiter().GetResult(); }
+            catch (Exception exception)
+            {
+                ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
+            }
+        }
         if (channelDelegate != IntPtr.Zero)
         {
             Delegates.TryRemove(channelDelegate, out _);
             ObjMsgSend(channelDelegate, ReleaseSelector);
         }
     }
+
+    // ===== IOBluetooth 辅助（必须在主线程调用） =====
 
     // 在系统配对表里按蓝牙地址找设备实例。
     private static IntPtr FindPairedDevice(ulong address)
@@ -692,23 +739,6 @@ internal sealed class MacRfcommConnection : IRawConnection
                 return device;
         }
         return IntPtr.Zero;
-    }
-
-    // 同步等待 SDP 查询完成（在主线程调用；回调经嵌套 run loop 抽取投递）。
-    private bool PerformSdpQuery(IntPtr device)
-    {
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        _sdpCompletion = completion;
-        if (ObjMsgSendSdpQuery(device, PerformSdpQuerySelector, _delegate) != KIoReturnSuccess)
-        {
-            _sdpCompletion = null;
-            return false;
-        }
-        var deadline = Stopwatch.StartNew();
-        while (!completion.Task.IsCompleted && deadline.ElapsedMilliseconds < SdpTimeoutMs)
-            PumpRunLoop(0.05);
-        _sdpCompletion = null;
-        return completion.Task.IsCompleted;
     }
 
     // 从 SDP 记录里抽取所有 RFCOMM 服务通道（GAIA/SPP 等一定注册在 SDP 上）。
@@ -766,9 +796,6 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
     }
 
-    private static void PumpRunLoop(double seconds)
-        => CFRunLoopRunInMode(DefaultRunLoopMode, seconds, false);
-
     // IOBluetoothDevice.addressString 形如 "1c-7a-43-7d-92-83"，与之对齐以便按地址匹配。
     private static string FormatAddress(ulong address)
         => $"{(address >> 40) & 0xFF:X2}-{(address >> 32) & 0xFF:X2}-{(address >> 24) & 0xFF:X2}-{(address >> 16) & 0xFF:X2}-{(address >> 8) & 0xFF:X2}-{address & 0xFF:X2}";
@@ -783,27 +810,6 @@ internal sealed class MacRfcommConnection : IRawConnection
 
     private static bool IsMainThread()
         => ObjMsgSendBool(NsThreadClass, IsMainThreadSelector) != 0;
-
-    // 把指定选择器派发到主线程并等待完成（waitUntilDone:YES）。
-    private void DispatchToMain(IntPtr selector)
-    {
-        if (IsMainThread())
-        {
-            InvokeSelector(selector);
-            return;
-        }
-        ObjMsgSendPerformOnMain(_delegate, PerformOnMainSelector, selector, IntPtr.Zero, 1);
-    }
-
-    private void InvokeSelector(IntPtr selector)
-    {
-        if (selector == RunSequenceSelector)
-            RunSequence();
-        else if (selector == RunWriteSelector)
-            RunWrite();
-        else if (selector == RunCloseSelector)
-            RunClose();
-    }
 
     private static IntPtr CreateDelegate(MacRfcommConnection owner)
     {
@@ -824,15 +830,10 @@ internal sealed class MacRfcommConnection : IRawConnection
         class_addMethod(cls, SelRegisterName("rfcommChannelData:data:length:"), ChannelDataImp, "v@:@^vQ");
         class_addMethod(cls, SelRegisterName("rfcommChannelClosed:"), ChannelClosedImp, "v@:@");
         class_addMethod(cls, SelRegisterName("sdpQueryComplete:status:"), SdpCompleteImp, "v@:@i");
-        class_addMethod(cls, SelRegisterName("runConnectionSequence:"), MainInvokeImp, "v@:@");
-        class_addMethod(cls, SelRegisterName("runWrite:"), MainInvokeImp, "v@:@");
-        class_addMethod(cls, SelRegisterName("runClose:"), MainInvokeImp, "v@:@");
+        class_addMethod(cls, SelRegisterName("runAction:"), MainInvokeImp, "v@:@");
         objc_registerClassPair(cls);
         return cls;
     }
-
-    private static IntPtr CreateRunLoopMode()
-        => CFStringCreateWithCString(IntPtr.Zero, "kCFRunLoopDefaultMode", 0x08000100);
 
     private static void OnChannelData(IntPtr self, IntPtr selector, IntPtr channel, IntPtr data, IntPtr length)
     {
@@ -852,11 +853,10 @@ internal sealed class MacRfcommConnection : IRawConnection
             connection.HandleSdpComplete();
     }
 
-    // 三个主线程选择器（连接序列/写入/关闭）共用同一个 IMP，按 selector 分发。
     private static void OnMainThreadInvoke(IntPtr self, IntPtr selector, IntPtr argument)
     {
         if (Delegates.TryGetValue(self, out var connection))
-            connection.InvokeSelector(selector);
+            connection.RunAction();
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -913,10 +913,4 @@ internal sealed class MacRfcommConnection : IRawConnection
     // performSelectorOnMainThread:withObject:waitUntilDone:
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
     private static extern void ObjMsgSendPerformOnMain(IntPtr self, IntPtr selector, IntPtr performSelector, IntPtr argument, byte wait);
-
-    [DllImport(CoreFoundation, EntryPoint = "CFRunLoopRunInMode")]
-    private static extern void CFRunLoopRunInMode(IntPtr mode, double seconds, bool returnAfterSourceHandled);
-
-    [DllImport(CoreFoundation, EntryPoint = "CFStringCreateWithCString", CharSet = CharSet.Ansi)]
-    private static extern IntPtr CFStringCreateWithCString(IntPtr alloc, string str, uint encoding);
 }
