@@ -331,6 +331,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private IntPtr _delegate;
     private int _connected;
     private int _disposed;
+    private int _tornDown;
     private volatile bool _stopRequested;
     private TaskCompletionSource? _pendingOpened;
     private Task? _sequenceTask;
@@ -393,35 +394,14 @@ internal sealed class MacRfcommConnection : IRawConnection
         _stopRequested = true;
         var wasConnected = Interlocked.Exchange(ref _connected, 0) != 0;
 
-        // 等待进行中的连接序列收尾，避免与其竞争主线程派发或提前释放委托。
+        // 等待进行中的连接序列收尾（有界），再统一执行幂等 teardown，
+        // 避免两条路径竞争关闭同一通道。
         if (_sequenceTask is not null)
         {
             try { await _sequenceTask.WaitAsync(TimeSpan.FromSeconds(3)); }
             catch { /* 序列异常已在连接路径处理 */ }
         }
-
-        IntPtr channel;
-        IntPtr channelDelegate;
-        lock (_channelGate)
-        {
-            channel = _channel;
-            _channel = IntPtr.Zero;
-            channelDelegate = _delegate;
-            _delegate = IntPtr.Zero;
-        }
-        if (channel != IntPtr.Zero)
-        {
-            try { await RunOnMainAsync(() => CloseChannel(channel)); }
-            catch (Exception exception)
-            {
-                ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
-            }
-        }
-        if (channelDelegate != IntPtr.Zero)
-        {
-            Delegates.TryRemove(channelDelegate, out _);
-            ObjMsgSend(channelDelegate, ReleaseSelector);
-        }
+        await TeardownAsync();
         if (wasConnected)
             Disconnected?.Invoke(this, EventArgs.Empty);
     }
@@ -477,7 +457,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         catch (Exception exception)
         {
             ApplicationLog.Current?.Error("Bluetooth", "macOS RFCOMM 连接失败。", exception);
-            TeardownChannel();
+            await TeardownAsync();
             opened.TrySetException(exception);
         }
     }
@@ -495,41 +475,60 @@ internal sealed class MacRfcommConnection : IRawConnection
     }
 
     // 打开指定通道并用两种 GAIA 前导码探活，返回可用于会话的通道。
+    // 任何单通道失败（打开/写入/探活）只意味着该通道不可用，绝不中止整个扫描。
     private async Task<IntPtr> TryActivateChannelAsync(IntPtr device, byte channelId)
     {
-        var channel = await OpenChannelOnMainAsync(device, channelId);
-        if (channel == IntPtr.Zero)
-            return IntPtr.Zero;
-
-        // 第一轮：OPPO 格式。OPPO/OnePlus/realme 及部分华为/小米设备直接应答。
-        if (await ProbeOnceAsync(channel, OppoProbeFrame, ProbeTimeoutMs))
-            return channel;
-
-        // 第二轮：换 vivo 格式。vivo 耳机被 0xAA 帧毒化后通道已关闭，需重开再试；
-        // 对仍然打开但沉默的通道（TEST/KTV 等服务）也再补一枪，成本仅一次探测超时。
-        if (!await IsChannelOpenAsync(channel))
+        try
         {
-            await CloseChannelOnMainAsync(channel);
-            channel = await OpenChannelOnMainAsync(device, channelId);
+            var channel = await OpenChannelOnMainAsync(device, channelId);
             if (channel == IntPtr.Zero)
                 return IntPtr.Zero;
-        }
-        if (await ProbeOnceAsync(channel, VivoProbeFrame, ProbeTimeoutMs))
-            return channel;
 
-        await CloseChannelOnMainAsync(channel);
-        return IntPtr.Zero;
+            // 第一轮：OPPO 格式。OPPO/OnePlus/realme 及部分华为/小米设备直接应答。
+            if (await ProbeOnceAsync(channel, OppoProbeFrame, ProbeTimeoutMs))
+                return channel;
+
+            // 第二轮：换 vivo 格式。vivo 耳机被 0xAA 帧毒化后通道已关闭，需重开再试；
+            // 对仍然打开但沉默的通道（TEST/KTV 等服务）也再补一枪，成本仅一次探测超时。
+            if (!await IsChannelOpenAsync(channel))
+            {
+                await CloseChannelOnMainAsync(channel);
+                channel = await OpenChannelOnMainAsync(device, channelId);
+                if (channel == IntPtr.Zero)
+                    return IntPtr.Zero;
+            }
+            if (await ProbeOnceAsync(channel, VivoProbeFrame, ProbeTimeoutMs))
+                return channel;
+
+            await CloseChannelOnMainAsync(channel);
+            return IntPtr.Zero;
+        }
+        catch (Exception exception)
+        {
+            // 单通道异常（对端已断开/写入被拒等）只淘汰该通道。
+            ApplicationLog.Current?.Debug("Bluetooth", $"RFCOMM 通道 {channelId} 探测异常，跳过：{exception.Message}");
+            return IntPtr.Zero;
+        }
     }
 
     // 发送一帧探活数据并等待应答：首字节为 GAIA 前导码（0xAA/0xFF）即视为活通道。
     // 应答数据由 HandleData 交给探活等待者，不进入 DataReceived，由上层按需重新查询。
+    // 写入失败（对端已断开等）视为该通道无响应，不抛异常。
     private async Task<bool> ProbeOnceAsync(IntPtr channel, byte[] frame, int timeoutMs)
     {
         var response = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _probeResponse, response);
         try
         {
-            await RunOnMainAsync(() => WriteRaw(channel, frame));
+            try
+            {
+                await RunOnMainAsync(() => WriteRaw(channel, frame));
+            }
+            catch (Exception exception)
+            {
+                ApplicationLog.Current?.Debug("Bluetooth", $"探活写入失败：{exception.Message}");
+                return false;
+            }
             using var timeout = new CancellationTokenSource(timeoutMs);
             await response.Task.WaitAsync(timeout.Token);
             var data = response.Task.Result;
@@ -625,6 +624,13 @@ internal sealed class MacRfcommConnection : IRawConnection
         await _mainSemaphore.WaitAsync();
         try
         {
+            // 委托在连接生命周期内永不释放：performSelectorOnMainThread 可能在
+            // 主线程队列中排队，若 receiver 被 release 会造成 use-after-free
+            // （实测 EXC_BAD_ACCESS 崩溃点）。委托仅创建一次，泄漏量可忽略。
+            var delegateHandle = _delegate;
+            if (delegateHandle == IntPtr.Zero)
+                throw new IOException("The RFCOMM delegate is unavailable.");
+
             var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             T result = default!;
             lock (_channelGate)
@@ -635,7 +641,7 @@ internal sealed class MacRfcommConnection : IRawConnection
             }
             // waitUntilDone:YES：本线程阻塞至主线程执行完该调用（调用不等待，故阻塞极短）。
             await Task.Run(() =>
-                ObjMsgSendPerformOnMain(_delegate, PerformOnMainSelector, RunActionSelector, IntPtr.Zero, 1));
+                ObjMsgSendPerformOnMain(delegateHandle, PerformOnMainSelector, RunActionSelector, IntPtr.Zero, 1));
             await completion.Task;
             return result;
         }
@@ -693,29 +699,28 @@ internal sealed class MacRfcommConnection : IRawConnection
         WriteRaw(channel, data);
     }
 
-    private void TeardownChannel()
+    // 幂等收尾：关闭已打开的通道。委托对象永不 release——performSelectorOnMainThread
+    // 可能仍在主线程队列中排队，release receiver 会造成 use-after-free（实测崩溃点）；
+    // 每连接仅一个 NSObject，随进程保留，量可忽略。
+    private async Task TeardownAsync()
     {
+        if (Interlocked.Exchange(ref _tornDown, 1) != 0)
+            return;
         IntPtr channel;
-        IntPtr channelDelegate;
         lock (_channelGate)
         {
             channel = _channel;
             _channel = IntPtr.Zero;
-            channelDelegate = _delegate;
-            _delegate = IntPtr.Zero;
         }
-        if (channel != IntPtr.Zero)
+        if (channel == IntPtr.Zero)
+            return;
+        try
         {
-            try { RunOnMainAsync(() => CloseChannel(channel)).GetAwaiter().GetResult(); }
-            catch (Exception exception)
-            {
-                ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
-            }
+            await RunOnMainAsync(() => CloseChannel(channel));
         }
-        if (channelDelegate != IntPtr.Zero)
+        catch (Exception exception)
         {
-            Delegates.TryRemove(channelDelegate, out _);
-            ObjMsgSend(channelDelegate, ReleaseSelector);
+            ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
         }
     }
 
@@ -835,28 +840,58 @@ internal sealed class MacRfcommConnection : IRawConnection
         return cls;
     }
 
+    // 以下四个 Obj-C 回调入口必须捕获一切异常：托管异常穿透到 Obj-C 运行时会直接
+    // 破坏 run loop 导致进程崩溃（EXC_BAD_ACCESS）。异常只记日志。
     private static void OnChannelData(IntPtr self, IntPtr selector, IntPtr channel, IntPtr data, IntPtr length)
     {
-        if (Delegates.TryGetValue(self, out var connection))
-            connection.HandleData(data, (int)length);
+        try
+        {
+            if (Delegates.TryGetValue(self, out var connection))
+                connection.HandleData(data, (int)length);
+        }
+        catch (Exception exception)
+        {
+            ApplicationLog.Current?.Error("Bluetooth", "RFCOMM 数据回调异常。", exception);
+        }
     }
 
     private static void OnChannelClosed(IntPtr self, IntPtr selector, IntPtr channel)
     {
-        if (Delegates.TryGetValue(self, out var connection))
-            connection.HandleClosed();
+        try
+        {
+            if (Delegates.TryGetValue(self, out var connection))
+                connection.HandleClosed();
+        }
+        catch (Exception exception)
+        {
+            ApplicationLog.Current?.Error("Bluetooth", "RFCOMM 关闭回调异常。", exception);
+        }
     }
 
     private static void OnSdpQueryComplete(IntPtr self, IntPtr selector, IntPtr device, int status)
     {
-        if (Delegates.TryGetValue(self, out var connection))
-            connection.HandleSdpComplete();
+        try
+        {
+            if (Delegates.TryGetValue(self, out var connection))
+                connection.HandleSdpComplete();
+        }
+        catch (Exception exception)
+        {
+            ApplicationLog.Current?.Error("Bluetooth", "SDP 完成回调异常。", exception);
+        }
     }
 
     private static void OnMainThreadInvoke(IntPtr self, IntPtr selector, IntPtr argument)
     {
-        if (Delegates.TryGetValue(self, out var connection))
-            connection.RunAction();
+        try
+        {
+            if (Delegates.TryGetValue(self, out var connection))
+                connection.RunAction();
+        }
+        catch (Exception exception)
+        {
+            ApplicationLog.Current?.Error("Bluetooth", "主线程派发回调异常。", exception);
+        }
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]

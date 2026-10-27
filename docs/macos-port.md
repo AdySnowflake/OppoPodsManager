@@ -175,9 +175,15 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 
 | 现象 | 原因 |
 |---|---|
-| `CS0102: already contains a definition for 'ChannelDataImp'` | delegate 类型与 IntPtr 字段同名。类型改名 `RfcommDataImp`/`RfcommClosedImp`/`RfcommSdpCompleteImp` |
+| `CS0102: already contains a definition for 'ChannelDataImp'` | delegate 类型与 IntPtr 字段同名。类型改名 `RfcommDataImp`/`RfcommClosedImp`/`RfcommSdpCompleteImp`/`RfcommMainInvokeImp`（**重写文件时已三次回归，扫描脚本见下**） |
 | `CS0136: A local or parameter named 'channel' cannot be declared in this scope` | C# 的 for/foreach 迭代变量作用域覆盖整个外层块，与后续 `IntPtr channel` 声明冲突。循环变量改名 `channelId` |
 | 局部变量与方法参数同名（`out var opened` vs `opened`） | C# 不允许，循环内改名 `openedChannel` |
+
+### 运行期铁律（Obj-C 互通）
+
+1. **Obj-C 回调入口（`class_addMethod` 注册的 IMP）必须 try/catch 一切**：托管异常穿透到 Obj-C 运行时会破坏 run loop，直接 SIGSEGV。
+2. **作为 `performSelectorOnMainThread` receiver 的对象永不 release**：派发可能在主线程队列排队，release 即 use-after-free。
+3. **主线程只做微秒级调用，不做秒级等待**（见 §3.3）。
 | `CS0117: 'Path' does not contain a definition for 'Combine'` / `CS0103: 'Directory'/'File' does not exist` | `#if MACOS` 自启块用了裸 `System.IO` 调用。文件里 `Avalonia.Controls.Shapes.Path` 与 `System.IO.Path` 冲突，**不能**直接加 `using System.IO;`，须全限定 `System.IO.*`（文件既有惯例） |
 
 ### 运行期
@@ -186,6 +192,9 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 |---|---|---|
 | 发现 0 设备（日志无蓝牙记录） | `device_connected` 在 Darwin 24 是**数组**而非对象，解析按对象形态被跳过 | `system_profiler SPBluetoothDataType -json \| python3 -m json.tool` |
 | 所有通道 18ms 内瞬时全败（`kIOReturnError`） | 连接序列跑在 .NET 后台线程——SDP 回调不投递 + RFCOMM 打开要求主线程（§3.3） | C 原型线程对照实验（主/后台同通道对比） |
+| UI 卡死 4-6 秒/次 | 连接序列（含秒级等待）整体占主线程；控制层每品牌重试 | 日志时间戳（每次尝试间隔 4-6s） |
+| **主线程 `performSelectorOnMainThread` 回调内 EXC_BAD_ACCESS（SIGSEGV）** | delegate 被 release 后派发仍在主线程队列中 → use-after-free | `~/Library/Logs/DiagnosticReports/*.ips`（崩溃线程 0，栈含 `__NSThreadPerformPerform`） |
+| 单通道探活写失败（`0xE00002CD` kIOReturnNotOpen）导致整个序列中止 | 异常直接穿透到序列 catch，未按“死通道”处理 | 日志堆栈 |
 | ch 11 打不开但 12/14/15 能开 | GAIA 会话被占用：手机 App 或本机 app 此前的连接未释放（对端会保留 DLC 一段时间） | 断开占用方 + 等待复测 |
 | 探活帧发出后通道关闭、零数据 | vivo 对 0xAA 帧的毒性反应（§4） | C 原型分帧测试 |
 
