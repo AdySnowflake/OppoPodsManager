@@ -4,6 +4,8 @@
 > 本文所有涉及 IOBluetooth 的结论均在 **macOS 15（Darwin 24）+ vivo TWS 4 + 第三方 USB 蓝牙加密狗**上实测验证（2026-10-27）。
 > 排查利器：`tools/macos-rfcomm-probe.c`（无 dotnet 环境下用 clang 直接验证 IOBluetooth 行为）。
 
+**当前状态**：端到端通信已验证打通（SDP 识别 GAIA 通道 → 打开 → 读电量成功，见 §5.2）；C# 侧已按同一逻辑实现，尚未经 app 真机确认。
+
 ---
 
 ## 1. 背景与拓扑
@@ -66,10 +68,19 @@ int fd = socket(31 /* AF_BLUETOOTH */, SOCK_STREAM, BTPROTO_RFCOMM);
 
 > 反面教材：早期实现把整个连接序列（含 30 通道 × 800ms 探活）搬上主线程，控制层每品牌重试一次 → UI 每次卡死 4-6 秒。**主线程只能做微秒级调用，绝不能做秒级等待。**
 
-### 3.4 通道优先级：SDP 登记通道优先，裸通道兜底
+### 3.4 通道选择：只探活协议服务通道 ⚠️
 
-1. SDP 服务记录里的 RFCOMM 通道（`getRFCOMMChannelID:`）——GAIA 等服务一定注册在 SDP 上；
-2. 裸通道 1–30 兜底（对应 Windows 实现的裸通道 1/15 策略的放大版）。
+耳机重连后 **GAIA 服务的 RFCOMM 通道号会变**（实测同一副 vivo TWS 4：先后出现在 ch 11 和 ch 12）——绝不能硬编码通道，必须每次从 SDP 实时读。
+
+通道列表构建顺序：
+
+1. **协议服务通道**（SDP 记录按**服务名含 "GAIA"** 或已知协议 UUID16 识别）——只探活这些；
+2. 若无协议服务：退回全部**非音频**通道；
+3. 若 SDP 完全不可用：才扫裸通道 1–30。
+
+> 为什么必须收紧到协议通道：向 TEST/KTV 等非协议通道写探活帧是**主线程永久卡死的直接原因**（IOBluetooth 的写入 block 在主队列执行，死通道的 socket 写永远不完成，见铁律 #4/#8）。收紧后 vivo TWS 4 的候选列表从 `[14, 12, 15]` 变为 `[12]`，从源头消除卡死触发条件。
+>
+> 实测坑：**vivo TWS 4 的 GAIA 服务用 `matchesUUID16:` 匹配不上任何 UUID**（vivo App 用的 0x0837、OPPO 的 0x079A 都不命中），**只能按服务名 "GAIA" 识别**——这是 CSR 系耳机（OPPO/OnePlus/realme/vivo）的通用约定。修复 UUID 匹配前务必用 C 原型验证，否则会以为修了其实无效。
 
 ---
 
@@ -100,33 +111,58 @@ int fd = socket(31 /* AF_BLUETOOTH */, SOCK_STREAM, BTPROTO_RFCOMM);
 
 ---
 
-## 5. 实测数据（vivo TWS 4，可作回归基线）
+## 5. 实测数据与通信验证（vivo TWS 4，可作回归基线）
+
+### 5.1 SDP 服务清单（同一副耳机，两次不同时刻）
 
 ```
-SDP 服务（14 个中的 RFCOMM 类）:
-  Hands-Free unit   ch 10
-  GAIA              ch 11   ← 厂商协议通道
-  KTV               ch 14
-  TEST              ch 15
+第 1 次:  Hands-Free ch 10 | GAIA ch 11 | KTV ch 14 | TEST ch 15
+第 2 次:  Hands-Free ch 10 | GAIA ch 12 | KTV ch 14 | TEST ch 15
+                        ^^^^^^ 重连后 GAIA 通道号从 11 变成了 12——必须每次实时读 SDP
+```
 
-打开 GAIA ch11 后:
-  发 FF 04 00 00 00 1B 02 07（vivo 电量查询）
-  → FF 03 00 05 00 1B 82 07 00 5C 5F FF 00   电量应答：0x5C=92% 0x5F=95%
-  → FF 03 00 01 00 1B 85 09 00               通知帧
+按服务名分类（C 原型 `matchesUUID16:` + 服务名实测）：
+
+| 通道 | 服务名 | 分类 | 处置 |
+|---|---|---|---|
+| 10 | Hands-Free unit | 音频 profile | 跳过（绝不写入） |
+| 12 | **GAIA** | 协议服务 | **探活目标** |
+| 14 | KTV | 其他 | 不探活（写入会卡死主线程） |
+| 15 | TEST | 其他 | 不探活（写入会卡死主线程） |
+
+### 5.2 端到端通信验证（2026-10-27，全部链路打通）
+
+按 §3.4 的选择逻辑（SDP 找 GAIA → 只开该通道 → 异步写）：
+
+```
+SDP 查询完成 → 找到 GAIA 服务: ch 12 → 打开 status=0x00000000
+发 FF 04 00 00 00 1B 02 07（vivo 电量查询）
+→ FF 03 00 05 00 1B 82 07 00 62 64 FF 00   电量应答：0x62=98%(左耳) 0x64=100%(右耳)
+→ FF 03 00 01 00 1B 85 09 00               通知帧（0x8509 时间请求）
+```
+
+帧格式对照（`FF [ver] [flags] [len] [vendor_hi] [vendor_lo] [cmd_hi] [cmd_lo] [payload]`）：
+应答 `FF 03 00 05 00 1B 82 07 | 00 62 64 FF 00` = ver 3 / flags 0 / len 5 / vendor 0x001B(VIVO) / cmd 0x8207(电量应答) / payload 含两耳电量。
+
+### 5.3 历史探活数据（供比对）
+
+```
+打开 GAIA 通道后:
   发 FF 04 00 00 00 0A 03 00（GAIA 握手 v4）
   → FF 03 00 04 00 0A 83 00 00 03 03 01      握手应答
   发 AA 07 00 00 03 01 F0 00 00（OPPO 帧）
-  → 通道被对端关闭                            ← vivo 毒性实证
+  → 通道被对端关闭                            ← vivo 毒性实证（§4）
 ```
 
 ---
 
 ## 6. 使用限制（硬件/生态，非 bug）
 
-1. **厂商协议会话单客户端**：vivo 耳机的 GAIA 会话同时只接受一个客户端。手机（vivo App）连着耳机时，Mac 侧打开 ch 11 直接返回 `kIOReturnError`——需先在手机侧断开耳机。日常使用预期同理。
+1. **厂商协议会话单客户端**：vivo 耳机的 GAIA 会话同时只接受一个客户端。实测中若手机（vivo App）或本机 app 的前一次连接未释放，Mac 侧打开 GAIA 通道会返回 `kIOReturnError`——需先在占用方断开。**注意**：耳机本身与手机同时工作是正常的（用户实测手机端可正常切模式/读电量），仅厂商协议通道独占。
 2. **ad-hoc 签名未公证**：产物首次运行需右键 → 打开（或 `xattr -dr com.apple.quarantine`）。要去掉这一步需 Apple Developer 账号公证。
 3. **x64 产物在 Apple Silicon 上走 Rosetta 2**；CI 的 `macos-latest` 是 arm64 主机交叉发布 `osx-x64`（非 AOT，交叉发布无问题）。
 4. **第三方 USB 蓝牙加密狗**：本机控制器为 `THIRD_PARTY_DONGLE`。A2DP/HFP/SDP/RFCOMM 均实测可用，但不排除其他廉价加密狗有额外兼容问题。
+5. **主线程卡死的残余风险**：即使只开协议通道，若写入时对端进入不回读的坏状态，IOBluetooth 的主队列写入 block 仍可能永久阻塞 UI（无法从进程内超时中断）。彻底方案是把蓝牙 IO 移到独立 helper 进程（UI 进程可检测并无响应重启），当前实现靠"只写 SDP 确认的协议通道 + 写入超时判定"把风险降到最低。
 
 ---
 
@@ -154,7 +190,9 @@ SDP 服务（14 个中的 RFCOMM 类）:
 
 ---
 
-## 8. 调试方法：没有 dotnet 时用 C 原型
+## 8. 调试方法与变更流程
+
+### 8.1 没有 dotnet 时用 C 原型
 
 本机未安装 .NET SDK 时，「改代码 → 推 CI → 读日志」一轮要几分钟。**更快的方法：用 clang 写 C 原型直接调 IOBluetooth + objc runtime**，几分钟内即可验证任何 API 行为假设。§3/§4/§5 的结论全部这样得出。
 
@@ -166,6 +204,23 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 ```
 
 要点：`objc_msgSend` 按签名各自声明 P/Invoke；委托类用 `objc_allocateClassPair` + `class_addMethod` 运行时创建；类型编码如数据回调 `"v@:@^vQ"`。
+
+### 8.2 卡死/崩溃定位三件套
+
+| 工具 | 用途 |
+|---|---|
+| 应用日志 `~/Library/Application Support/OppoPodsManager/Logs/` | 连接流程时间线、异常堆栈 |
+| `~/Library/Logs/DiagnosticReports/*.ips` | 崩溃类型与崩溃线程栈（JSON，第一行是头部） |
+| `sample <pid> 3 -file /tmp/s.txt` | **卡死现场**：主线程栈停在哪个调用（找 `mach_msg`/`writeSync`/`performSelector`） |
+
+### 8.3 变更流程（血的教训，必须遵守）
+
+本移植早期"改完就推"，导致同一 bug 反复回归、未验证假设白费多轮。**每次改动 IOBluetooth 相关代码，按此顺序**：
+
+1. **C 原型验证假设**：任何"某个 API 行为应该是 X"的判断，先用 clang 原型实测（例：`matchesUUID16:` 匹配 GAIA 失败、`writeAsync` 仍在主队列阻塞，都是原型先发现的）
+2. **静态检查**：成员名冲突扫描（delegate 类型 vs 字段）、花括号/圆括号配平
+3. **独立 review**：让未参与编写的 agent 按 §3 约束挑并发/内存/签名问题
+4. **才提交推送**
 
 ---
 
@@ -188,7 +243,16 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 5. **`openRFCOMMChannelSync` 暂用同步版**：数十次实测均快速返回（成功/失败都不阻塞）；若未来出现打开卡死，按第 4 条同样改造为 `openRFCOMMChannelAsync:`。
 6. **IOBluetooth 返回的对象必须 retain**：`openRFCOMMChannelSync:` 出参、`pairedDevices` 元素都是 **autoreleased** 对象——主线程 run loop 每处理完一个事件就 drain autorelease 池，不 retain 的对象在**下一次派达时已被释放、内存被复用**，之后任何调用都崩（实测 `doesNotRecognizeSelector` → SIGABRT），且会把 blued 会话搞断（表现为蓝牙整体断联）。取得时 retain，关闭时 `closeChannel` + `release` 配对。
 7. **探活帧绝不写音频 profile 通道**：往 Hands-Free(0x111E/0x111F)/A2DP(0x110A/0x110B)/AVRCP(0x110E/0x110F) 写协议垃圾会干扰音频链路，实测导致耳机反复断联。用 `matchesUUID16:` 在 SDP 枚举阶段就排除这些通道。
-8. **控制层重试频率远高于耳机恢复速度**（设备列表每 2s 变化 × 每品牌各试一次），无退避的全通道扫描等于对耳机 DDoS。按设备地址做 10s 失败退避 + 仅扫 SDP 登记的非音频通道（SDP 为空才退回裸 1-30）。
+8. **只探活协议服务通道**：向 TEST/KTV 等非协议通道写探活帧是主线程卡死的直接原因——IOBluetooth 的写入 block 在主队列执行，死通道的 socket 写永远不完成（`sample` 实测 100% 卡在 `writeAsync → CFWriteStreamWrite → mach_msg`）。协议通道按**服务名含 "GAIA"**（CSR 系耳机 OPPO/OnePlus/realme/vivo 的通用约定）或已知协议 UUID16（vivo 0x0837 / OPPO 0x079A / Edifier 0xEDF0 / SPP 0x1101）识别；实测 vivo TWS 4 的 GAIA 服务 `matchesUUID16:` 匹配不上任何 UUID，**只能按名识别**。
+9. **控制层重试频率远高于耳机恢复速度**（设备列表每 2s 变化 × 每品牌各试一次），无退避的全通道扫描等于对耳机 DDoS。按设备地址做 10s 失败退避 + 仅扫 SDP 登记的协议通道（SDP 为空才退回裸 1-30）。
+
+### 编译期
+
+| 现象 | 原因 |
+|---|---|
+| `CS0102: already contains a definition for 'ChannelDataImp'` | delegate 类型与 IntPtr 字段同名。类型改名 `RfcommDataImp`/`RfcommClosedImp`/`RfcommSdpCompleteImp`/`RfcommMainInvokeImp`（**重写文件时已三次回归，每次推送前必须跑成员名扫描**） |
+| `CS0136: A local or parameter named 'channel' cannot be declared in this scope` | C# 的 for/foreach 迭代变量作用域覆盖整个外层块，与后续 `IntPtr channel` 声明冲突。循环变量改名 `channelId` |
+| 局部变量与方法参数同名（`out var opened` vs `opened`） | C# 不允许，循环内改名 `openedChannel` |
 | `CS0117: 'Path' does not contain a definition for 'Combine'` / `CS0103: 'Directory'/'File' does not exist` | `#if MACOS` 自启块用了裸 `System.IO` 调用。文件里 `Avalonia.Controls.Shapes.Path` 与 `System.IO.Path` 冲突，**不能**直接加 `using System.IO;`，须全限定 `System.IO.*`（文件既有惯例） |
 
 ### 运行期
@@ -199,23 +263,27 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 | 所有通道 18ms 内瞬时全败（`kIOReturnError`） | 连接序列跑在 .NET 后台线程——SDP 回调不投递 + RFCOMM 打开要求主线程（§3.3） | C 原型线程对照实验（主/后台同通道对比） |
 | UI 卡死 4-6 秒/次 | 连接序列（含秒级等待）整体占主线程；控制层每品牌重试 | 日志时间戳（每次尝试间隔 4-6s） |
 | **UI 永久卡死（主线程 100% 占用）** | `writeSync:length:` 在主线程嵌套 run loop 里等 socket 可写，对端不读即永久阻塞（`mach_msg`） | `sample <pid> 3`：主线程栈停在 `-[IOBluetoothRFCOMMChannel writeSync:length:] → CFWriteStreamWrite → mach_msg` |
+| **改 writeAsync 后仍卡死** | IOBluetooth 把写操作 block 派发到**主队列**执行，底层还是同步 socket 写——坏通道照样永久阻塞 | `sample`：主线程栈停在 `__CFRUNLOOP_IS_SERVICING_THE_MAIN_DISPATCH_QUEUE → __53-[IOBluetoothRFCOMMChannel writeA...] → CFWriteStreamWrite → mach_msg` |
 | 所有通道打开返回 `0xE00002D6` (kIOReturnTimeout) | 耳机被反复探活后进入拒绝状态，需静置恢复 | C 原型逐通道打印 status |
 | 耳机音频链路反复断联（但 ACL 仍连接） | 探活帧写进了 Hands-Free/A2DP 等音频 profile 通道 | `matchesUUID16:` 枚举阶段排除音频 profile 后恢复 |
 | **主线程 `performSelectorOnMainThread` 回调内 EXC_BAD_ACCESS（SIGSEGV）** | delegate 被 release 后派发仍在主线程队列中 → use-after-free | `~/Library/Logs/DiagnosticReports/*.ips`（崩溃线程 0，栈含 `__NSThreadPerformPerform`） |
 | **SIGABRT + `doesNotRecognizeSelector`，且蓝牙整体断联** | IOBluetooth 返回的 autoreleased 对象未 retain，被 run loop 的 autorelease 池回收后内存复用 | `*.ips` 栈含 `objc_exception_throw → doesNotRecognizeSelector → _CF_forwarding_prep_0` |
 | 单通道探活写失败（`0xE00002CD` kIOReturnNotOpen）导致整个序列中止 | 异常直接穿透到序列 catch，未按“死通道”处理 | 日志堆栈 |
-| ch 11 打不开但 12/14/15 能开 | GAIA 会话被占用：手机 App 或本机 app 此前的连接未释放（对端会保留 DLC 一段时间） | 断开占用方 + 等待复测 |
+| GAIA 通道号变化（ch 11 → ch 12）导致连不上 | 耳机重连后重新广告服务，通道号动态分配 | 每次从 SDP 实时读，勿硬编码 |
+| 协议服务 UUID 匹配无效（以为修了其实没用） | vivo 的 GAIA 服务 `matchesUUID16:` 匹配不上任何 UUID | C 原型先打印每个服务的 audio/protocol 分类再改代码 |
 | 探活帧发出后通道关闭、零数据 | vivo 对 0xAA 帧的毒性反应（§4） | C 原型分帧测试 |
 
 ### IOReturn 速查
 
-`0xE00002BC = kIOReturnError`（通用错误）；错误码定义见 SDK `IOReturn.h`（`iokit_common_err(0x2bc)`）。
+`0xE00002BC = kIOReturnError`（通用错误）、`0xE00002CD = kIOReturnNotOpen`、`0xE00002D6 = kIOReturnTimeout`；错误码定义见 SDK `IOReturn.h`（`iokit_common_err(0x2bc)` 等）。
 
 ---
 
 ## 10. 后续可选方向
 
+- **helper 进程隔离蓝牙 IO**（§6.5 残余风险的彻底方案）：把 IOBluetooth 的全部操作移进独立可执行文件，UI 进程经 stdio/NamedPipe 通信；helper 卡死可被检测并重启，UI 永不被拖累。当前"只写协议通道 + 超时"已把风险降到最低，暂不值得做。
 - **osx-arm64 产物**：CI 加一个 matrix 条目即可（`macos-latest` 原生 arm64，无需 Rosetta）。
 - **AirPods BLE 广播**：上游 Windows 有 `IAppleAdvertisementProvider`，macOS 可用 CoreBluetooth 实现，非阻塞。
 - **公证/ notarization**：需要 Apple Developer 账号与 CI secrets。
 - **连接时自动唤起系统蓝牙**：当前设计只接管已连接设备（与 Windows/Linux 一致）；如要做，可在发现层调用 `IOBluetoothDevice openConnection`。
+- **通道选择缓存**：同一耳机短时间内 GAIA 通道号通常不变，可按地址缓存（带 TTL）省掉每次 SDP 枚举。
