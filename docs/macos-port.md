@@ -68,19 +68,15 @@ int fd = socket(31 /* AF_BLUETOOTH */, SOCK_STREAM, BTPROTO_RFCOMM);
 
 > 反面教材：早期实现把整个连接序列（含 30 通道 × 800ms 探活）搬上主线程，控制层每品牌重试一次 → UI 每次卡死 4-6 秒。**主线程只能做微秒级调用，绝不能做秒级等待。**
 
-### 3.4 通道选择：只探活协议服务通道 ⚠️
+### 3.4 通道选择：只写明确识别的协议通道 ⚠️
 
 耳机重连后 **GAIA 服务的 RFCOMM 通道号会变**（实测同一副 vivo TWS 4：先后出现在 ch 11 和 ch 12）——绝不能硬编码通道，必须每次从 SDP 实时读。
 
-通道列表构建顺序：
+通道列表构建：**只**返回 SDP 中匹配协议服务（**服务名含 "GAIA"** 或已知协议 UUID16）的通道。
 
-1. **协议服务通道**（SDP 记录按**服务名含 "GAIA"** 或已知协议 UUID16 识别）——只探活这些；
-2. 若无协议服务：退回全部**非音频**通道；
-3. 若 SDP 完全不可用：才扫裸通道 1–30。
-
-> 为什么必须收紧到协议通道：向 TEST/KTV 等非协议通道写探活帧是**主线程永久卡死的直接原因**（IOBluetooth 的写入 block 在主队列执行，死通道的 socket 写永远不完成，见铁律 #4/#8）。收紧后 vivo TWS 4 的候选列表从 `[14, 12, 15]` 变为 `[12]`，从源头消除卡死触发条件。
+> 刻意不做其它回退（非协议通道 / 裸通道 1-30）：向 TEST/KTV 等未识别通道写探活帧会**永久阻塞主线程**（IOBluetooth 的写入 block 在主队列执行，死通道的 socket 写永不完成，见铁律 #4/#8），也可能写进 Hands-Free 等音频通道干扰音频链路。代价是无法识别协议服务的设备连不上——**这优于卡死 UI**，需要时按品牌补充识别规则。
 >
-> 实测坑：**vivo TWS 4 的 GAIA 服务用 `matchesUUID16:` 匹配不上任何 UUID**（vivo App 用的 0x0837、OPPO 的 0x079A 都不命中），**只能按服务名 "GAIA" 识别**——这是 CSR 系耳机（OPPO/OnePlus/realme/vivo）的通用约定。修复 UUID 匹配前务必用 C 原型验证，否则会以为修了其实无效。
+> 实测坑：**vivo TWS 4 的 GAIA 服务用 `matchesUUID16:` 匹配不上任何 UUID**（它用 128 位 UUID `00000837-D102-...` 注册；vivo App 的 0x0837、OPPO 的 0x079A 均返回 0），**只能按服务名 "GAIA" 识别**——这是 CSR 系耳机（OPPO/OnePlus/realme/vivo）的通用约定。改这段逻辑前务必用 C 原型打印每个服务的分类，否则会以为修了其实无效（独立 review 就这样抓到了一版"只实现了一半"的修复）。
 
 ---
 
@@ -215,11 +211,11 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 
 ### 8.3 变更流程（血的教训，必须遵守）
 
-本移植早期"改完就推"，导致同一 bug 反复回归、未验证假设白费多轮。**每次改动 IOBluetooth 相关代码，按此顺序**：
+本移植早期"改完就推"，导致同一 bug 反复回归、未验证假设白费多轮、独立 review 缺位。**每次改动 IOBluetooth 相关代码，按此顺序**：
 
-1. **C 原型验证假设**：任何"某个 API 行为应该是 X"的判断，先用 clang 原型实测（例：`matchesUUID16:` 匹配 GAIA 失败、`writeAsync` 仍在主队列阻塞，都是原型先发现的）
-2. **静态检查**：成员名冲突扫描（delegate 类型 vs 字段）、花括号/圆括号配平
-3. **独立 review**：让未参与编写的 agent 按 §3 约束挑并发/内存/签名问题
+1. **C 原型验证假设**：任何"某个 API 行为应该是 X"的判断，先用 clang 原型实测（例：`matchesUUID16:` 匹配 GAIA 失败、`writeAsync` 仍在主队列阻塞、refcon 原样回传，都是原型先发现的）
+2. **静态检查**：成员名冲突扫描（delegate 类型 vs 字段——同一错误曾三次回归）、花括号/圆括号配平、死代码检查
+3. **独立 review**：让未参与编写的 agent 按 §3/§9 约束挑并发/内存/签名问题（曾抓到两个 P0：协议通道识别只实现一半、`_stopRequested` 单向闩锁否决 vivo 两段式探活）
 4. **才提交推送**
 
 ---
@@ -244,7 +240,10 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 6. **IOBluetooth 返回的对象必须 retain**：`openRFCOMMChannelSync:` 出参、`pairedDevices` 元素都是 **autoreleased** 对象——主线程 run loop 每处理完一个事件就 drain autorelease 池，不 retain 的对象在**下一次派达时已被释放、内存被复用**，之后任何调用都崩（实测 `doesNotRecognizeSelector` → SIGABRT），且会把 blued 会话搞断（表现为蓝牙整体断联）。取得时 retain，关闭时 `closeChannel` + `release` 配对。
 7. **探活帧绝不写音频 profile 通道**：往 Hands-Free(0x111E/0x111F)/A2DP(0x110A/0x110B)/AVRCP(0x110E/0x110F) 写协议垃圾会干扰音频链路，实测导致耳机反复断联。用 `matchesUUID16:` 在 SDP 枚举阶段就排除这些通道。
 8. **只探活协议服务通道**：向 TEST/KTV 等非协议通道写探活帧是主线程卡死的直接原因——IOBluetooth 的写入 block 在主队列执行，死通道的 socket 写永远不完成（`sample` 实测 100% 卡在 `writeAsync → CFWriteStreamWrite → mach_msg`）。协议通道按**服务名含 "GAIA"**（CSR 系耳机 OPPO/OnePlus/realme/vivo 的通用约定）或已知协议 UUID16（vivo 0x0837 / OPPO 0x079A / Edifier 0xEDF0 / SPP 0x1101）识别；实测 vivo TWS 4 的 GAIA 服务 `matchesUUID16:` 匹配不上任何 UUID，**只能按名识别**。
-9. **控制层重试频率远高于耳机恢复速度**（设备列表每 2s 变化 × 每品牌各试一次），无退避的全通道扫描等于对耳机 DDoS。按设备地址做 10s 失败退避 + 仅扫 SDP 登记的协议通道（SDP 为空才退回裸 1-30）。
+9. **控制层重试频率远高于耳机恢复速度**（设备列表每 2s 变化 × 每品牌各试一次），无退避的全通道扫描等于对耳机 DDoS。按设备地址做 10s 失败退避 + 只写协议通道。
+10. **"对端关通道"与"调用方中止"必须是两个标志**：vivo 两段式探活的第一段（OPPO 帧）必然触发对端主动关通道（毒性），若据此置位统一的中止标志，第二段探活即使成功也会被否决——vivo 全系永远连不上。`HandleClosed` 只释放本通道引用并上报断开事件，绝不置中止位。
+11. **在飞写入必须能精确定位**：`writeAsync:length:refcon:` 的 refcon 会原样回传到 `rfcommChannelWriteComplete:refcon:status:`（实测验证）。用 GCHandle 包装「缓冲区 + 完成者」作 refcon，完成回调凭它释放**属于该次写入**的缓冲区——否则超时遗留的在飞写会让后续写的完成回调释放别人的缓冲区（use-after-free）。
+12. **主线程派发必须有界**：`performSelectorOnMainThread:waitUntilDone:YES` 入队到主 run loop 的 default mode，菜单跟踪/模态/主线程被占时永不执行。等待要有超时并作废登记，否则整条连接链无限挂死（且 `Task.Run` 里的 `waitUntilDone` 会长期占用线程池线程）。
 
 ### 编译期
 

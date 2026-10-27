@@ -280,6 +280,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private const int ConnectTimeoutSeconds = 30;
     private const int WriteTimeoutMs = 3000;
     private const int ProbeWriteTimeoutMs = 500;
+    private const int DispatchTimeoutMs = 5000;
 
     // 死通道探活帧。GAIA 协议有两个前导码流派，必须分别试探：
     //   · OPPO/OnePlus/realme：0xAA 前导（OPPO ProductId 0x0103 查询），对端直接回 GAIA 帧；
@@ -304,14 +305,11 @@ internal sealed class MacRfcommConnection : IRawConnection
     // 委托对象指针 → 连接实例，供 Obj-C 回调找到托管侧接收者。
     private static readonly ConcurrentDictionary<IntPtr, MacRfcommConnection> Delegates = new();
 
-    // 已知音频 profile 的 UUID16：探活帧绝不能写进这些通道——往 Hands-Free/A2DP/AVRCP
-    // 写协议垃圾会干扰音频链路（实测导致耳机反复断联）。
-    private static readonly ushort[] AudioProfileUuids = { 0x110A, 0x110B, 0x110E, 0x110F, 0x111E, 0x111F };
-
-    // 已知协议服务的 UUID16（GAIA 家族 / SPP）：只有这些通道才值得探活。
-    // 向 TEST/KTV 等非协议通道写探活帧是主线程卡死的直接原因——IOBluetooth 的写入
-    // block 在主队列执行，死通道的 socket 写永远不完成（sample 实测 100% 卡在
-    // writeAsync → CFWriteStreamWrite → mach_msg）。
+    // 已知协议服务的 UUID16（GAIA 家族 / SPP）：与"服务名含 GAIA"共同识别协议通道。
+    // 注意实测：vivo TWS 4 的 GAIA 服务用 128 位 UUID 注册，matchesUUID16: 对
+    // 0x0837/0x079A 均返回 0——所以名称匹配才是主路径，UUID16 只是补充。
+    // 音频 profile（HSP 0x1108/0x1112、Hands-Free 0x111E/0x111F、A2DP/AVRCP 等）
+    // 不可能是协议服务，天然被本过滤器排除，无需单独维护音频 UUID 清单。
     private static readonly ushort[] ProtocolServiceUuids = { 0x0837, 0x079A, 0xEDF0, 0x1101 };
 
     // 扫描失败退避：控制层高频重试（设备列表每 2s 变化、每品牌各试一次），无退避会
@@ -355,18 +353,17 @@ internal sealed class MacRfcommConnection : IRawConnection
     private int _connected;
     private int _disposed;
     private int _tornDown;
-    private volatile bool _stopRequested;
+    private volatile bool _abortRequested;
     private TaskCompletionSource? _pendingOpened;
     private Task? _sequenceTask;
     private TaskCompletionSource<byte[]>? _probeResponse;
     private TaskCompletionSource<bool>? _sdpCompletion;
     private Action? _mainAction;
     private TaskCompletionSource? _mainCompletion;
-    // 异步写入：缓冲区必须用非托管内存（IOBluetooth 在写完成前一直持有该指针），
-    // 由 rfcommChannelWriteComplete 回调释放；绝不用 writeSync——它会在主线程
-    // 的嵌套 run loop 里等 socket 可写，对端不读时永久阻塞（实测 UI 卡死根因）。
-    private IntPtr _pendingWriteBuffer;
-    private TaskCompletionSource? _pendingWriteCompletion;
+    // 异步写入：缓冲区用非托管内存（IOBluetooth 完成前一直持有），每次写作用
+    // GCHandle 作 refcon 传入，完成回调凭 refcon 精确定位是哪一次写——超时遗留
+    // 的在飞写绝不会释放别人在飞的缓冲区。绝不用 writeSync（主线程嵌套 run loop
+    // 等 socket 可写，对端不读即永久阻塞，实测 UI 卡死根因）。
 
     public MacRfcommConnection(DeviceCandidate candidate)
     {
@@ -401,7 +398,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         catch
         {
             // 序列可能仍在扫描，通知其中止并等待其收尾，避免通道刚打开就被遗留。
-            _stopRequested = true;
+            _abortRequested = true;
             try { await sequence.WaitAsync(TimeSpan.FromSeconds(3)); }
             catch { /* 序列自身的异常已由 _pendingOpened 承载 */ }
             throw;
@@ -416,12 +413,22 @@ internal sealed class MacRfcommConnection : IRawConnection
             channel = _channel;
         if (channel == IntPtr.Zero || Volatile.Read(ref _connected) == 0)
             throw new IOException("The RFCOMM channel is not open.");
-        await WriteToChannelAsync(channel, data.ToArray(), WriteTimeoutMs, cancellationToken);
+        // 跨 await 自持引用：否则此窗口内对端断开（HandleClosed 会 release 我们的
+        // 唯一所有权引用）后，写派发就指向已销毁对象。
+        channel = RetainObject(channel);
+        try
+        {
+            await WriteToChannelAsync(channel, data.ToArray(), WriteTimeoutMs, cancellationToken);
+        }
+        finally
+        {
+            ReleaseObject(channel);
+        }
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken)
     {
-        _stopRequested = true;
+        _abortRequested = true;
         var wasConnected = Interlocked.Exchange(ref _connected, 0) != 0;
 
         // 等待进行中的连接序列收尾（有界），再统一执行幂等 teardown，
@@ -473,7 +480,7 @@ internal sealed class MacRfcommConnection : IRawConnection
             // kIOReturnError(0xE00002BC)，实测与 delegate/设备对象形态无关。
             if (!await PerformSdpQueryAsync(device))
                 ApplicationLog.Current?.Debug("Bluetooth", "SDP 查询未在预算内完成，按裸通道继续。");
-            if (_stopRequested)
+            if (_abortRequested)
                 throw new IOException("The connection was cancelled.");
 
             // SDP 登记的 RFCOMM 通道优先（GAIA 等服务一定注册在 SDP 上），裸通道 1-30 兜底。
@@ -483,14 +490,30 @@ internal sealed class MacRfcommConnection : IRawConnection
             IntPtr live = IntPtr.Zero;
             foreach (var id in channels)
             {
-                if (_stopRequested)
+                if (_abortRequested)
                     break;
                 live = await TryActivateChannelAsync(device, id);
                 if (live != IntPtr.Zero)
                     break;
             }
-            if (live == IntPtr.Zero || _stopRequested)
+            if (live == IntPtr.Zero || _abortRequested)
                 throw new IOException("No RFCOMM channel is available.");
+
+            // 置连接前复检：探活成功到此处之间对端可能已关通道（HandleClosed 见
+            // _channel 仍为零不会处理），否则会以"已连接"返回一个死通道。
+            if (!await IsChannelOpenAsync(live))
+            {
+                await CloseChannelOnMainAsync(live);
+                throw new IOException("The channel closed before the connection completed.");
+            }
+
+            // teardown 可能已并发执行（DisconnectAsync 只给序列 3 秒收尾），
+            // 此时必须关闭刚打开的通道，否则链路泄漏且已 Dispose 的连接仍显示已连接。
+            if (_tornDown != 0)
+            {
+                await CloseChannelOnMainAsync(live);
+                throw new IOException("The connection was torn down.");
+            }
 
             lock (_channelGate)
                 _channel = live;
@@ -501,59 +524,41 @@ internal sealed class MacRfcommConnection : IRawConnection
         catch (Exception exception)
         {
             ApplicationLog.Current?.Error("Bluetooth", "macOS RFCOMM 连接失败。", exception);
-            ScanBackoff[_address] = DateTime.UtcNow;
+            // 调用方主动取消不计退避，否则手动取消后 10s 内无法重连。
+            if (!_abortRequested)
+                ScanBackoff[_address] = DateTime.UtcNow;
             await TeardownAsync();
             opened.TrySetException(exception);
         }
     }
 
-    // 构建探活通道列表：优先 SDP 中匹配协议服务 UUID 的通道；没有协议服务时才退回
-    // 全部非音频通道；SDP 完全不可用才扫裸通道 1-30。
+    // 构建探活通道列表：**只**返回 SDP 中匹配协议服务（服务名含 "GAIA" 或已知协议
+    // UUID16）的通道。
+    //
+    // 刻意不做其它回退（非协议通道/裸通道 1-30）：向 TEST/KTV 等未识别通道写探活帧
+    // 会永久阻塞主线程（IOBluetooth 的写入 block 在主队列执行，死通道的 socket 写
+    // 永不完成，sample 实测），也可能写进 Hands-Free 等音频通道干扰音频链路。
+    // 代价是无法识别协议服务的设备连不上——这优于卡死 UI，需要时按品牌补充识别规则。
     private static List<byte> BuildChannelList(IntPtr device)
     {
-        var protocolChannels = new List<byte>();
-        var otherChannels = new List<byte>();
+        var channels = new List<byte>();
         var services = ObjMsgSend(device, GetServicesSelector);
-        if (services != IntPtr.Zero)
+        if (services == IntPtr.Zero)
+            return channels;
+        var count = ObjMsgSendCount(services, CountSelector);
+        for (ulong index = 0; index < count; index++)
         {
-            var count = ObjMsgSendCount(services, CountSelector);
-            for (ulong index = 0; index < count; index++)
-            {
-                var record = ObjMsgSendObjectAtIndex(services, ObjectAtIndexSelector, index);
-                if (record == IntPtr.Zero)
-                    continue;
-                if (ObjMsgSendGetRfcommChannel(record, GetRfcommChannelSelector, out var channel) != KIoReturnSuccess || channel == 0)
-                    continue;
-                // 跳过音频 profile 通道，绝不向其写入。
-                if (IsAudioProfile(record))
-                    continue;
-                if (IsProtocolService(record))
-                {
-                    if (!protocolChannels.Contains(channel))
-                        protocolChannels.Add(channel);
-                }
-                else if (!otherChannels.Contains(channel))
-                {
-                    otherChannels.Add(channel);
-                }
-            }
+            var record = ObjMsgSendObjectAtIndex(services, ObjectAtIndexSelector, index);
+            if (record == IntPtr.Zero)
+                continue;
+            if (ObjMsgSendGetRfcommChannel(record, GetRfcommChannelSelector, out var channel) != KIoReturnSuccess || channel == 0)
+                continue;
+            if (!IsProtocolService(record))
+                continue;
+            if (!channels.Contains(channel))
+                channels.Add(channel);
         }
-
-        // 有明确协议通道就只探这些——向非协议通道（TEST/KTV 等）写探活帧可能永久
-        // 阻塞主线程，是卡死的直接原因。
-        var channels = protocolChannels.Count > 0 ? protocolChannels : otherChannels;
-        if (channels.Count == 0)
-            for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
-                channels.Add((byte)channelId);
         return channels;
-    }
-
-    private static bool IsAudioProfile(IntPtr record)
-    {
-        foreach (var uuid in AudioProfileUuids)
-            if (ObjMsgSendBoolArg(record, MatchesUuid16Selector, uuid) != 0)
-                return true;
-        return false;
     }
 
     private static bool IsProtocolService(IntPtr record)
@@ -574,9 +579,10 @@ internal sealed class MacRfcommConnection : IRawConnection
     // 任何单通道失败（打开/写入/探活）只意味着该通道不可用，绝不中止整个扫描。
     private async Task<IntPtr> TryActivateChannelAsync(IntPtr device, byte channelId)
     {
+        var channel = IntPtr.Zero;
         try
         {
-            var channel = await OpenChannelOnMainAsync(device, channelId);
+            channel = await OpenChannelOnMainAsync(device, channelId);
             if (channel == IntPtr.Zero)
                 return IntPtr.Zero;
 
@@ -601,8 +607,17 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
         catch (Exception exception)
         {
-            // 单通道异常（对端已断开/写入被拒等）只淘汰该通道。
+            // 单通道异常（对端已断开/写入被拒等）只淘汰该通道；已打开的通道必须关闭，
+            // 否则泄漏的 RFCOMM 链路会被对端保留、阻塞后续连接。
             ApplicationLog.Current?.Debug("Bluetooth", $"RFCOMM 通道 {channelId} 探测异常，跳过：{exception.Message}");
+            if (channel != IntPtr.Zero)
+            {
+                try { await CloseChannelOnMainAsync(channel); }
+                catch (Exception closeException)
+                {
+                    ApplicationLog.Current?.Debug("Bluetooth", $"关闭异常通道失败：{closeException.Message}");
+                }
+            }
             return IntPtr.Zero;
         }
     }
@@ -687,7 +702,9 @@ internal sealed class MacRfcommConnection : IRawConnection
 
     private void HandleClosed()
     {
-        _stopRequested = true;
+        // 注意：绝不在此置位 _abortRequested——vivo 两段式探活的第一段（OPPO 帧）
+        // 会触发对端主动关通道（vivo 毒性），若据此中止整个序列，第二段探活即使
+        // 成功也会被否决。对端关通道只释放本通道引用并上报断开事件。
         IntPtr channel;
         lock (_channelGate)
         {
@@ -701,9 +718,11 @@ internal sealed class MacRfcommConnection : IRawConnection
             Disconnected?.Invoke(this, EventArgs.Empty);
     }
 
-    private void HandleSdpComplete()
+    private void HandleSdpComplete(int status)
     {
-        _sdpCompletion?.TrySetResult(true);
+        // 必须判状态：SDP 查询失败时 getServices 只会返回过期缓存，据此构建的通道
+        // 列表不可信（历史上表现为"候选通道列表有值但全部打不开"）。
+        _sdpCompletion?.TrySetResult(status == KIoReturnSuccess);
     }
 
     // ===== 主线程派发 =====
@@ -739,7 +758,26 @@ internal sealed class MacRfcommConnection : IRawConnection
             // waitUntilDone:YES：本线程阻塞至主线程执行完该调用（调用不等待，故阻塞极短）。
             await Task.Run(() =>
                 ObjMsgSendPerformOnMain(delegateHandle, PerformOnMainSelector, RunActionSelector, IntPtr.Zero, 1));
-            await completion.Task;
+
+            // 主线程可能处于菜单跟踪/模态/被其它原生调用占住而不泵 default mode，
+            // 此时派发永不执行——必须有界等待并作废登记，否则整条连接链无限挂死。
+            using var dispatchTimeout = new CancellationTokenSource(DispatchTimeoutMs);
+            try
+            {
+                await completion.Task.WaitAsync(dispatchTimeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                lock (_channelGate)
+                {
+                    if (ReferenceEquals(_mainCompletion, completion))
+                    {
+                        _mainAction = null;
+                        _mainCompletion = null;
+                    }
+                }
+                throw new IOException("The main-thread dispatch timed out.");
+            }
             return result;
         }
         finally
@@ -818,8 +856,8 @@ internal sealed class MacRfcommConnection : IRawConnection
             }
             catch (OperationCanceledException)
             {
-                // 超时：通道可能已卡死。缓冲区不在此处释放——IOBluetooth 可能仍持有该指针，
-                // 交由写完成回调释放；若回调永不到达则泄漏少量非托管内存（仅故障路径）。
+                // 超时：通道可能已卡死。缓冲区经 refcon 与本次写绑定，绝不会被后续写
+                // 的完成回调误释放；若本次回调永不到达则泄漏一份（仅故障路径）。
                 throw new IOException("RFCOMM write timed out.");
             }
         }
@@ -829,37 +867,53 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
     }
 
-    // 主线程：发起异步写入。立即失败时就地释放缓冲区并完成等待者。
+    // 一次在飞写入：缓冲区与完成者绑定，经 GCHandle 作 refcon 传给 writeAsync。
+    private sealed class InflightWrite
+    {
+        public required IntPtr Buffer { get; init; }
+        public required TaskCompletionSource Completion { get; init; }
+    }
+
+    // 主线程：发起异步写入。refcon 用 GCHandle 标识本次写入，完成回调凭它精确定位。
     private void StartWrite(IntPtr channel, IntPtr buffer, ushort length, TaskCompletionSource completion)
     {
-        _pendingWriteCompletion = completion;
-        _pendingWriteBuffer = buffer;
-        var status = ObjMsgSendWriteAsync(channel, WriteAsyncSelector, buffer, length, IntPtr.Zero);
-        if (status != KIoReturnSuccess)
+        var inflight = new InflightWrite { Buffer = buffer, Completion = completion };
+        var handle = GCHandle.Alloc(inflight);
+        try
         {
-            ReleaseWriteBuffer();
-            completion.TrySetException(new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}."));
+            var status = ObjMsgSendWriteAsync(channel, WriteAsyncSelector, buffer, length, (IntPtr)handle);
+            if (status != KIoReturnSuccess)
+            {
+                // 立即失败：IOBluetooth 未接管缓冲区，就地释放。
+                handle.Free();
+                Marshal.FreeHGlobal(buffer);
+                completion.TrySetException(new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}."));
+            }
+        }
+        catch
+        {
+            handle.Free();
+            throw;
         }
     }
 
-    // 主线程委托回调：写入已交给硬件，释放缓冲区并唤醒等待者。
-    private void HandleWriteComplete(int status)
+    // 主线程委托回调：写入已交给硬件。凭 refcon 找到对应的写入，释放其缓冲区并唤醒等待者。
+    private void HandleWriteComplete(IntPtr refcon, int status)
     {
-        var completion = Interlocked.Exchange(ref _pendingWriteCompletion, null);
-        ReleaseWriteBuffer();
-        if (completion is null)
+        if (refcon == IntPtr.Zero)
             return;
+        var handle = GCHandle.FromIntPtr(refcon);
+        if (!handle.IsAllocated)
+            return;
+        var inflight = handle.Target as InflightWrite;
+        handle.Free();
+        if (inflight is null)
+            return;
+        Marshal.FreeHGlobal(inflight.Buffer);
         if (status == KIoReturnSuccess)
-            completion.TrySetResult();
+            inflight.Completion.TrySetResult();
         else
-            completion.TrySetException(new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}."));
-    }
-
-    private void ReleaseWriteBuffer()
-    {
-        var buffer = Interlocked.Exchange(ref _pendingWriteBuffer, IntPtr.Zero);
-        if (buffer != IntPtr.Zero)
-            Marshal.FreeHGlobal(buffer);
+            inflight.Completion.TrySetException(new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}."));
     }
 
     // 幂等收尾：关闭已打开的通道。委托对象永不 release——performSelectorOnMainThread
@@ -871,13 +925,21 @@ internal sealed class MacRfcommConnection : IRawConnection
             return;
         IntPtr channel;
         IntPtr device;
+        IntPtr channelDelegate;
         lock (_channelGate)
         {
             channel = _channel;
             _channel = IntPtr.Zero;
             device = _device;
             _device = IntPtr.Zero;
+            channelDelegate = _delegate;
+            _delegate = IntPtr.Zero;
         }
+        // 从回调字典摘除自己：字典是静态强引用，不摘则每次连接尝试都永久泄漏一个
+        // 托管连接对象（控制层高频重试下持续增长）。原生 delegate 对象仍不 release
+        // （排队中的派发可能还在引用它），只是不再被回调引用。
+        if (channelDelegate != IntPtr.Zero)
+            Delegates.TryRemove(channelDelegate, out _);
         if (channel != IntPtr.Zero)
         {
             try
@@ -990,8 +1052,9 @@ internal sealed class MacRfcommConnection : IRawConnection
             throw new InvalidOperationException("Failed to allocate the IOBluetooth delegate class.");
         class_addMethod(cls, SelRegisterName("rfcommChannelData:data:length:"), ChannelDataImp, "v@:@^vQ");
         class_addMethod(cls, SelRegisterName("rfcommChannelClosed:"), ChannelClosedImp, "v@:@");
-        class_addMethod(cls, SelRegisterName("sdpQueryComplete:status:"), SdpCompleteImp, "v@:@i");
-        class_addMethod(cls, SelRegisterName("rfcommChannelWriteComplete:refcon:status:"), WriteCompleteImp, "v@:@^vi");
+        // IOReturn 是 unsigned int，类型编码用 "I"（不是 "i"）。
+        class_addMethod(cls, SelRegisterName("sdpQueryComplete:status:"), SdpCompleteImp, "v@:@I");
+        class_addMethod(cls, SelRegisterName("rfcommChannelWriteComplete:refcon:status:"), WriteCompleteImp, "v@:@^vI");
         class_addMethod(cls, SelRegisterName("runAction:"), MainInvokeImp, "v@:@");
         objc_registerClassPair(cls);
         return cls;
@@ -1030,7 +1093,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         try
         {
             if (Delegates.TryGetValue(self, out var connection))
-                connection.HandleSdpComplete();
+                connection.HandleSdpComplete(status);
         }
         catch (Exception exception)
         {
@@ -1043,7 +1106,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         try
         {
             if (Delegates.TryGetValue(self, out var connection))
-                connection.HandleWriteComplete(status);
+                connection.HandleWriteComplete(refcon, status);
         }
         catch (Exception exception)
         {
