@@ -16,6 +16,10 @@ public static class CommunicationBootstrap
         return new CommunicationController(
             [new Linux.LinuxConnectionFactory(), new Linux.LinuxGattConnectionFactory()],
             [new Linux.LinuxBluetoothDiscovery()]);
+#elif MACOS
+        return new CommunicationController(
+            [new MacOS.MacConnectionFactory()],
+            [new MacOS.MacBluetoothDiscovery()]);
 #else
         return new CommunicationController([], []);
 #endif

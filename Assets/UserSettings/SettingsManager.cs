@@ -43,11 +43,15 @@ public sealed class SettingsManager
         Changed?.Invoke(this, changed);
     }
 
-    // 保存开机启动设置并同步 Windows 登录启动项。
+    // 保存开机启动设置并同步当前平台的登录启动项。
     public void SetAutoStart(bool enabled)
     {
         Update(settings => settings with { StartWithWindows = enabled });
+#if WINDOWS
         WindowsStartup.TrySetEnabled(enabled);
+#elif MACOS
+        MacStartup.TrySetEnabled(enabled);
+#endif
     }
 
     private static AppSettings Load(string path)

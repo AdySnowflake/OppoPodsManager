@@ -20,7 +20,7 @@
     <ApplicationIcon>Assets\VisualAssets\tuopan.ico</ApplicationIcon>
     <TargetFramework Condition="'$(EnableWindowsBackend)' == 'true'">net10.0-windows10.0.19041.0</TargetFramework>
     <TargetFramework Condition="'$(EnableWindowsBackend)' != 'true'">net10.0</TargetFramework>
-    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64</RuntimeIdentifiers>
+    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;osx-x64;osx-arm64</RuntimeIdentifiers>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>OppoPodsManager</RootNamespace>
@@ -38,25 +38,45 @@
     <DebuggerSupport>false</DebuggerSupport>
   </PropertyGroup>
 
-  <!-- Linux 传输使用 BlueZ D-Bus；Windows 专属文件不参与 Linux 编译。 -->
-  <PropertyGroup Condition="'$(EnableWindowsBackend)' != 'true'">
+  <!-- Linux 传输使用 BlueZ D-Bus，macOS 走 IOBluetooth；Windows 专属文件不参与 Linux/macOS 编译。 -->
+  <PropertyGroup Condition="'$(EnableWindowsBackend)' != 'true' and !$([MSBuild]::IsOSPlatform('OSX'))">
     <DefineConstants>$(DefineConstants);LINUX</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(EnableWindowsBackend)' != 'true' and $([MSBuild]::IsOSPlatform('OSX'))">
+    <DefineConstants>$(DefineConstants);MACOS</DefineConstants>
   </PropertyGroup>
   <PropertyGroup Condition="'$(EnableWindowsBackend)' == 'true'">
     <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
   </PropertyGroup>
 
-  <ItemGroup Condition="'$(EnableWindowsBackend)' != 'true'">
+  <!-- macOS 不走 NativeAOT：arm64 主机交叉发布 osx-x64 时 ILC 不支持跨架构，本地 AOT 也依赖 Xcode 工具链。 -->
+  <PropertyGroup Condition="'$(EnableWindowsBackend)' != 'true' and $([MSBuild]::IsOSPlatform('OSX'))">
+    <PublishAot>false</PublishAot>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(EnableWindowsBackend)' != 'true' and !$([MSBuild]::IsOSPlatform('OSX'))">
     <PackageReference Include="Tmds.DBus" Version="0.94.2" />
     <!-- 裁剪保护：Tmds.DBus 用反射动态生成 D-Bus 代理（IGattCharacteristic1 等），
          不标记为 root 会被 IL 裁切器删掉代理生成路径，导致 Linux GATT 链路运行期失效。 -->
     <TrimmerRootAssembly Include="Tmds.DBus" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(EnableWindowsBackend)' != 'true'">
     <Compile Remove="Communication\Transport\Windows\**\*.cs" />
     <Compile Remove="Communication\Windows\**\*.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(EnableWindowsBackend)' == 'true'">
     <Compile Remove="Communication\Transport\Linux\**\*.cs" />
     <Compile Remove="Communication\Linux\**\*.cs" />
+    <Compile Remove="Communication\macOS\**\*.cs" />
+  </ItemGroup>
+  <!-- macOS 主机构建：排除 Linux 平台实现（BlueZ/Tmds.DBus 在 macOS 不可用）。 -->
+  <ItemGroup Condition="'$(EnableWindowsBackend)' != 'true' and $([MSBuild]::IsOSPlatform('OSX'))">
+    <Compile Remove="Communication\Transport\Linux\**\*.cs" />
+    <Compile Remove="Communication\Linux\**\*.cs" />
+  </ItemGroup>
+  <!-- Linux 主机构建：排除 macOS 平台实现（IOBluetooth 互操作仅在 macOS 可用）。 -->
+  <ItemGroup Condition="'$(EnableWindowsBackend)' != 'true' and !$([MSBuild]::IsOSPlatform('OSX'))">
+    <Compile Remove="Communication\macOS\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
