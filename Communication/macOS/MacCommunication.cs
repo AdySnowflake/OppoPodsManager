@@ -323,6 +323,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static readonly IntPtr IsOpenSelector = SelRegisterName("isOpen");
     private static readonly IntPtr AllocSelector = SelRegisterName("alloc");
     private static readonly IntPtr InitSelector = SelRegisterName("init");
+    private static readonly IntPtr RetainSelector = SelRegisterName("retain");
     private static readonly IntPtr ReleaseSelector = SelRegisterName("release");
 
     private readonly DeviceCandidate _candidate;
@@ -434,16 +435,19 @@ internal sealed class MacRfcommConnection : IRawConnection
             return;
         try
         {
-            // 设备对象来自 pairedDevices（withAddress: 创建的游离对象打不开 RFCOMM）。
+            // 设备对象来自 pairedDevices（withAddress: 创建的游离对象打不开 RFCOMM），已 retain。
             var device = await RunOnMainAsync(() => FindPairedDevice(_address));
             if (device == IntPtr.Zero)
                 throw new IOException("The paired device was not found.");
-            _device = device;
+            lock (_channelGate)
+                _device = device;
 
             // IOBluetooth 打开 RFCOMM 前必须先完成一次 SDP 查询：未查询时所有通道都返回
             // kIOReturnError(0xE00002BC)，实测与 delegate/设备对象形态无关。
-            if (!await PerformSdpQueryAsync())
+            if (!await PerformSdpQueryAsync(device))
                 ApplicationLog.Current?.Debug("Bluetooth", "SDP 查询未在预算内完成，按裸通道继续。");
+            if (_stopRequested)
+                throw new IOException("The connection was cancelled.");
 
             // SDP 登记的 RFCOMM 通道优先（GAIA 等服务一定注册在 SDP 上），裸通道 1-30 兜底。
             var channels = await RunOnMainAsync(() => BuildChannelList(device));
@@ -557,7 +561,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     }
 
     // 主线程发起 SDP 查询，后台等待其完成回调。
-    private async Task<bool> PerformSdpQueryAsync()
+    private async Task<bool> PerformSdpQueryAsync(IntPtr device)
     {
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _sdpCompletion = completion;
@@ -565,7 +569,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         {
             await RunOnMainAsync(() =>
             {
-                var status = ObjMsgSendSdpQuery(_device, PerformSdpQuerySelector, _delegate);
+                var status = ObjMsgSendSdpQuery(device, PerformSdpQuerySelector, _delegate);
                 if (status != KIoReturnSuccess)
                     completion.TrySetResult(false);
             });
@@ -610,8 +614,9 @@ internal sealed class MacRfcommConnection : IRawConnection
             channel = _channel;
             _channel = IntPtr.Zero;
         }
+        // 对端已关闭，只需释放我们的 retain，不再调用 closeChannel。
         if (channel != IntPtr.Zero)
-            CloseChannel(channel);
+            ReleaseObject(channel);
         if (Interlocked.Exchange(ref _connected, 0) != 0)
             Disconnected?.Invoke(this, EventArgs.Empty);
     }
@@ -688,15 +693,20 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
     }
 
+    // 打开通道并 retain（出参是 autoreleased 对象，跨 run loop 事件必须 retain）。
     private async Task<IntPtr> OpenChannelOnMainAsync(IntPtr device, byte channelId)
     {
         var channel = IntPtr.Zero;
-        await RunOnMainAsync(() => TryOpenChannel(device, channelId, _delegate, out channel));
+        await RunOnMainAsync(() =>
+        {
+            if (TryOpenChannel(device, channelId, _delegate, out var opened))
+                channel = RetainObject(opened);
+        });
         return channel;
     }
 
     private async Task CloseChannelOnMainAsync(IntPtr channel)
-        => await RunOnMainAsync(() => CloseChannel(channel));
+        => await RunOnMainAsync(() => CloseAndReleaseChannel(channel));
 
     private async Task<bool> IsChannelOpenAsync(IntPtr channel)
         => await RunOnMainAsync(() => IsChannelOpen(channel));
@@ -780,26 +790,35 @@ internal sealed class MacRfcommConnection : IRawConnection
         if (Interlocked.Exchange(ref _tornDown, 1) != 0)
             return;
         IntPtr channel;
+        IntPtr device;
         lock (_channelGate)
         {
             channel = _channel;
             _channel = IntPtr.Zero;
+            device = _device;
+            _device = IntPtr.Zero;
         }
-        if (channel == IntPtr.Zero)
-            return;
-        try
+        if (channel != IntPtr.Zero)
         {
-            await RunOnMainAsync(() => CloseChannel(channel));
+            try
+            {
+                await RunOnMainAsync(() => CloseAndReleaseChannel(channel));
+            }
+            catch (Exception exception)
+            {
+                ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
+            }
         }
-        catch (Exception exception)
-        {
-            ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
-        }
+        // 释放设备对象的 retain（FindPairedDevice 时配对 retain）。
+        ReleaseObject(device);
     }
 
     // ===== IOBluetooth 辅助（必须在主线程调用） =====
 
     // 在系统配对表里按蓝牙地址找设备实例。
+    // 返回值是 autoreleased 对象：主线程 run loop 每处理完一个事件就会 drain
+    // autorelease 池，不 retain 的话下次派达时对象已失效（实测 doesNotRecognizeSelector
+    // 崩溃 + 蓝牙断联）。因此这里直接返回 retain 后的引用，由 TeardownAsync 释放。
     private static IntPtr FindPairedDevice(ulong address)
     {
         var paired = ObjMsgSend(IoBluetoothDeviceClass, PairedDevicesSelector);
@@ -814,9 +833,18 @@ internal sealed class MacRfcommConnection : IRawConnection
                 continue;
             var addressString = NSStringToString(ObjMsgSend(device, AddressStringSelector));
             if (addressString is not null && addressString.Equals(expected, StringComparison.OrdinalIgnoreCase))
-                return device;
+                return RetainObject(device);
         }
         return IntPtr.Zero;
+    }
+
+    private static IntPtr RetainObject(IntPtr obj)
+        => obj == IntPtr.Zero ? IntPtr.Zero : ObjMsgSend(obj, RetainSelector);
+
+    private static void ReleaseObject(IntPtr obj)
+    {
+        if (obj != IntPtr.Zero)
+            ObjMsgSend(obj, ReleaseSelector);
     }
 
     // 从 SDP 记录里抽取所有 RFCOMM 服务通道（GAIA/SPP 等一定注册在 SDP 上）。
@@ -857,6 +885,15 @@ internal sealed class MacRfcommConnection : IRawConnection
         {
             ApplicationLog.Current?.Debug("Bluetooth", $"关闭 RFCOMM 通道异常：{exception.Message}");
         }
+    }
+
+    // 关闭通道并释放我们的 retain（打开时配对 retain，避免 autorelease 池回收后失效）。
+    private static void CloseAndReleaseChannel(IntPtr channel)
+    {
+        if (channel == IntPtr.Zero)
+            return;
+        CloseChannel(channel);
+        ReleaseObject(channel);
     }
 
     // IOBluetoothDevice.addressString 形如 "1c-7a-43-7d-92-83"，与之对齐以便按地址匹配。
