@@ -167,7 +167,7 @@ Avalonia.Native ... The menu being updated does not match. (Parameter 'menu')
 
 ## 6. 使用限制（硬件/生态，非 bug）
 
-1. **厂商协议会话单客户端**：vivo 耳机的 GAIA 会话同时只接受一个客户端。实测中若手机（vivo App）或本机 app 的前一次连接未释放，Mac 侧打开 GAIA 通道会返回 `kIOReturnError`——需先在占用方断开。**注意**：耳机本身与手机同时工作是正常的（用户实测手机端可正常切模式/读电量），仅厂商协议通道独占。
+1. **手机与 Mac 可同时操作**：vivo 耳机支持多客户端——手机（vivo App）和 Mac 同时连着，各自读电量/切模式互不影响。调试期“莫名连不上”的实际原因通常是：本机 app 前一次连接未释放的 RFCOMM 链路（对端会保留 DLC 一段时间），或 GAIA 通道号动态变化（§3.4）。
 2. **ad-hoc 签名未公证**：产物首次运行需右键 → 打开（或 `xattr -dr com.apple.quarantine`）。要去掉这一步需 Apple Developer 账号公证。
 3. **x64 产物在 Apple Silicon 上走 Rosetta 2**；CI 的 `macos-latest` 是 arm64 主机交叉发布 `osx-x64`（非 AOT，交叉发布无问题）。
 4. **第三方 USB 蓝牙加密狗**：本机控制器为 `THIRD_PARTY_DONGLE`。A2DP/HFP/SDP/RFCOMM 均实测可用，但不排除其他廉价加密狗有额外兼容问题。
