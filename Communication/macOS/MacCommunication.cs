@@ -308,6 +308,12 @@ internal sealed class MacRfcommConnection : IRawConnection
     // 写协议垃圾会干扰音频链路（实测导致耳机反复断联）。
     private static readonly ushort[] AudioProfileUuids = { 0x110A, 0x110B, 0x110E, 0x110F, 0x111E, 0x111F };
 
+    // 已知协议服务的 UUID16（GAIA 家族 / SPP）：只有这些通道才值得探活。
+    // 向 TEST/KTV 等非协议通道写探活帧是主线程卡死的直接原因——IOBluetooth 的写入
+    // block 在主队列执行，死通道的 socket 写永远不完成（sample 实测 100% 卡在
+    // writeAsync → CFWriteStreamWrite → mach_msg）。
+    private static readonly ushort[] ProtocolServiceUuids = { 0x0837, 0x079A, 0xEDF0, 0x1101 };
+
     // 扫描失败退避：控制层高频重试（设备列表每 2s 变化、每品牌各试一次），无退避会
     // 持续骚扰耳机。按设备地址记录最近失败时间，窗口内直接失败不再扫通道。
     private static readonly ConcurrentDictionary<ulong, DateTime> ScanBackoff = new();
@@ -323,6 +329,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static readonly IntPtr RunActionSelector = SelRegisterName("runAction:");
     private static readonly IntPtr PerformSdpQuerySelector = SelRegisterName("performSDPQuery:");
     private static readonly IntPtr GetServicesSelector = SelRegisterName("getServices");
+    private static readonly IntPtr GetServiceNameSelector = SelRegisterName("getServiceName");
     private static readonly IntPtr GetRfcommChannelSelector = SelRegisterName("getRFCOMMChannelID:");
     private static readonly IntPtr MatchesUuid16Selector = SelRegisterName("matchesUUID16:");
     private static readonly IntPtr CountSelector = SelRegisterName("count");
@@ -500,9 +507,12 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
     }
 
+    // 构建探活通道列表：优先 SDP 中匹配协议服务 UUID 的通道；没有协议服务时才退回
+    // 全部非音频通道；SDP 完全不可用才扫裸通道 1-30。
     private static List<byte> BuildChannelList(IntPtr device)
     {
-        var channels = new List<byte>();
+        var protocolChannels = new List<byte>();
+        var otherChannels = new List<byte>();
         var services = ObjMsgSend(device, GetServicesSelector);
         if (services != IntPtr.Zero)
         {
@@ -514,14 +524,24 @@ internal sealed class MacRfcommConnection : IRawConnection
                     continue;
                 if (ObjMsgSendGetRfcommChannel(record, GetRfcommChannelSelector, out var channel) != KIoReturnSuccess || channel == 0)
                     continue;
-                // 跳过音频 profile 通道，只探活协议类服务（GAIA/SPP/厂商私有）。
+                // 跳过音频 profile 通道，绝不向其写入。
                 if (IsAudioProfile(record))
                     continue;
-                if (!channels.Contains(channel))
-                    channels.Add(channel);
+                if (IsProtocolService(record))
+                {
+                    if (!protocolChannels.Contains(channel))
+                        protocolChannels.Add(channel);
+                }
+                else if (!otherChannels.Contains(channel))
+                {
+                    otherChannels.Add(channel);
+                }
             }
         }
-        // 仅当 SDP 没给出任何可用通道时才退回裸通道 1-30 兜底。
+
+        // 有明确协议通道就只探这些——向非协议通道（TEST/KTV 等）写探活帧可能永久
+        // 阻塞主线程，是卡死的直接原因。
+        var channels = protocolChannels.Count > 0 ? protocolChannels : otherChannels;
         if (channels.Count == 0)
             for (var channelId = 1; channelId <= MaxRfcommChannel; channelId++)
                 channels.Add((byte)channelId);
@@ -531,6 +551,20 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static bool IsAudioProfile(IntPtr record)
     {
         foreach (var uuid in AudioProfileUuids)
+            if (ObjMsgSendBoolArg(record, MatchesUuid16Selector, uuid) != 0)
+                return true;
+        return false;
+    }
+
+    private static bool IsProtocolService(IntPtr record)
+    {
+        // 服务名含 GAIA——CSR 系耳机（OPPO/OnePlus/realme/vivo）的通用约定，
+        // 实测 vivo TWS 4 的 GAIA 服务用 UUID16 matchesUUID16: 匹配不上，只能按名识别。
+        var name = NSStringToString(ObjMsgSend(record, GetServiceNameSelector));
+        if (name is not null && name.Contains("GAIA", StringComparison.OrdinalIgnoreCase))
+            return true;
+        // 同时接受已知协议服务的 UUID16（部分设备以 UUID 标识）。
+        foreach (var uuid in ProtocolServiceUuids)
             if (ObjMsgSendBoolArg(record, MatchesUuid16Selector, uuid) != 0)
                 return true;
         return false;
