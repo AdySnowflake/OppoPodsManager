@@ -32,7 +32,7 @@ int fd = socket(31 /* AF_BLUETOOTH */, SOCK_STREAM, BTPROTO_RFCOMM);
 
 ---
 
-## 3. IOBluetooth 接入四要点（全部实测，缺一不可）
+## 3. IOBluetooth 接入要点（全部实测，缺一不可）
 
 ### 3.1 设备对象必须来自 `+pairedDevices`
 
@@ -51,11 +51,18 @@ int fd = socket(31 /* AF_BLUETOOTH */, SOCK_STREAM, BTPROTO_RFCOMM);
 
 **未做 SDP 查询时，`openRFCOMMChannelSync:withChannelID:delegate:` 对任何通道都返回 `kIOReturnError`（0xE00002BC）**。这与 delegate 是否为 NULL、设备对象来源无关——这是 app 首次连接全部失败（"No RFCOMM channel is available"）的真正原因。
 
-### 3.3 委托回调投递到开通道的线程，该线程必须持续抽取 run loop
+### 3.3 一切 IOBluetooth 操作必须在主线程执行 ⚠️
 
-IOBluetooth 的 `rfcommChannelData:data:length:` 回调在**打开通道的线程**上投递。该线程若不运行 run loop，回调全部丢失（表现：通道打开成功、写入成功、但永远收不到数据）。
+实测结论（C 原型对照实验，`tools/macos-rfcomm-probe.c` 同款手法）：
 
-实现：专用后台线程完成「开通道 + 探活 + 整个生命周期」，以 `CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false)` 持续抽取；写入也收敛到该线程（与 Linux 实现「读循环线程 + 写调用方线程」模式对应，但 macOS 侧统一到同线程更稳）。
+| 线程 | SDP 回调 | `openRFCOMMChannelSync` |
+|---|---|---|
+| 主线程 | ✅ 投递 | ✅ 成功 |
+| 后台线程 | ❌ 永不投递（`performSDPQuery` 照样返回 0） | ❌ 全部 `kIOReturnError`(0xE00002BC) |
+
+同一个通道、同一 SDP 完成状态下，主线程打开成功、后台线程立即失败。**这不是“开通道的线程”，而是“必须是主线程”**——后台线程上 SDP 查询看似成功（调用返回 0、`getServices` 还能读到系统缓存），但回调不投递、查询实际未完成，后续打开必然全败。
+
+实现：连接序列（SDP + 开通道 + 探活）、写入、关闭全部经 `performSelectorOnMainThread:withObject:waitUntilDone:` 派发到主线程；等待应答时在主线程回调内用**嵌套** `CFRunLoopRunInMode` 抽取。稳态下数据回调由主线程已有的 run loop（Avalonia 主循环）天然投递，无需自建线程。
 
 ### 3.4 通道优先级：SDP 登记通道优先，裸通道兜底
 
@@ -176,8 +183,8 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 | 现象 | 原因 | 定位手段 |
 |---|---|---|
 | 发现 0 设备（日志无蓝牙记录） | `device_connected` 在 Darwin 24 是**数组**而非对象，解析按对象形态被跳过 | `system_profiler SPBluetoothDataType -json \| python3 -m json.tool` |
-| 所有通道 `kIOReturnError`(0xE00002BC) | 缺 SDP 查询前置（§3.2） | C 原型逐项排除 |
-| ch 11 打不开但 12/14/15 能开 | 手机占着 GAIA 会话（§6.1） | 断开手机蓝牙后复测 |
+| 所有通道 18ms 内瞬时全败（`kIOReturnError`） | 连接序列跑在 .NET 后台线程——SDP 回调不投递 + RFCOMM 打开要求主线程（§3.3） | C 原型线程对照实验（主/后台同通道对比） |
+| ch 11 打不开但 12/14/15 能开 | GAIA 会话被占用：手机 App 或本机 app 此前的连接未释放（对端会保留 DLC 一段时间） | 断开占用方 + 等待复测 |
 | 探活帧发出后通道关闭、零数据 | vivo 对 0xAA 帧的毒性反应（§4） | C 原型分帧测试 |
 
 ### IOReturn 速查
