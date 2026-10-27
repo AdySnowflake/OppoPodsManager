@@ -278,6 +278,8 @@ internal sealed class MacRfcommConnection : IRawConnection
     private const int ProbeTimeoutMs = 400;
     private const int SdpTimeoutMs = 5000;
     private const int ConnectTimeoutSeconds = 30;
+    private const int WriteTimeoutMs = 3000;
+    private const int ProbeWriteTimeoutMs = 500;
 
     // 死通道探活帧。GAIA 协议有两个前导码流派，必须分别试探：
     //   · OPPO/OnePlus/realme：0xAA 前导（OPPO ProductId 0x0103 查询），对端直接回 GAIA 帧；
@@ -291,9 +293,11 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static readonly RfcommClosedImp ChannelClosedCallback = OnChannelClosed;
     private static readonly RfcommSdpCompleteImp SdpCompleteCallback = OnSdpQueryComplete;
     private static readonly RfcommMainInvokeImp MainInvokeCallback = OnMainThreadInvoke;
+    private static readonly RfcommWriteCompleteImp WriteCompleteCallback = OnWriteComplete;
     private static readonly IntPtr ChannelDataImp = Marshal.GetFunctionPointerForDelegate(ChannelDataCallback);
     private static readonly IntPtr ChannelClosedImp = Marshal.GetFunctionPointerForDelegate(ChannelClosedCallback);
     private static readonly IntPtr SdpCompleteImp = Marshal.GetFunctionPointerForDelegate(SdpCompleteCallback);
+    private static readonly IntPtr WriteCompleteImp = Marshal.GetFunctionPointerForDelegate(WriteCompleteCallback);
     private static readonly IntPtr MainInvokeImp = Marshal.GetFunctionPointerForDelegate(MainInvokeCallback);
     private static readonly IntPtr DelegateClass = CreateDelegateClass();
 
@@ -314,7 +318,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static readonly IntPtr CountSelector = SelRegisterName("count");
     private static readonly IntPtr ObjectAtIndexSelector = SelRegisterName("objectAtIndex:");
     private static readonly IntPtr OpenChannelSelector = SelRegisterName("openRFCOMMChannelSync:withChannelID:delegate:");
-    private static readonly IntPtr WriteSelector = SelRegisterName("writeSync:length:");
+    private static readonly IntPtr WriteAsyncSelector = SelRegisterName("writeAsync:length:refcon:");
     private static readonly IntPtr CloseSelector = SelRegisterName("closeChannel");
     private static readonly IntPtr IsOpenSelector = SelRegisterName("isOpen");
     private static readonly IntPtr AllocSelector = SelRegisterName("alloc");
@@ -324,6 +328,7 @@ internal sealed class MacRfcommConnection : IRawConnection
     private readonly DeviceCandidate _candidate;
     private readonly object _channelGate = new();
     private readonly SemaphoreSlim _mainSemaphore = new(1, 1);
+    private readonly SemaphoreSlim _writeSemaphore = new(1, 1);
 
     private ulong _address;
     private IntPtr _device;
@@ -339,6 +344,11 @@ internal sealed class MacRfcommConnection : IRawConnection
     private TaskCompletionSource<bool>? _sdpCompletion;
     private Action? _mainAction;
     private TaskCompletionSource? _mainCompletion;
+    // 异步写入：缓冲区必须用非托管内存（IOBluetooth 在写完成前一直持有该指针），
+    // 由 rfcommChannelWriteComplete 回调释放；绝不用 writeSync——它会在主线程
+    // 的嵌套 run loop 里等 socket 可写，对端不读时永久阻塞（实测 UI 卡死根因）。
+    private IntPtr _pendingWriteBuffer;
+    private TaskCompletionSource? _pendingWriteCompletion;
 
     public MacRfcommConnection(DeviceCandidate candidate)
     {
@@ -383,10 +393,12 @@ internal sealed class MacRfcommConnection : IRawConnection
     public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        if (Volatile.Read(ref _connected) == 0)
+        IntPtr channel;
+        lock (_channelGate)
+            channel = _channel;
+        if (channel == IntPtr.Zero || Volatile.Read(ref _connected) == 0)
             throw new IOException("The RFCOMM channel is not open.");
-        var payload = data.ToArray();
-        await RunOnMainAsync(() => WriteCurrentChannel(payload));
+        await WriteToChannelAsync(channel, data.ToArray(), WriteTimeoutMs, cancellationToken);
     }
 
     public async Task DisconnectAsync(CancellationToken cancellationToken)
@@ -522,7 +534,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         {
             try
             {
-                await RunOnMainAsync(() => WriteRaw(channel, frame));
+                await WriteToChannelAsync(channel, frame, ProbeWriteTimeoutMs, CancellationToken.None);
             }
             catch (Exception exception)
             {
@@ -689,14 +701,75 @@ internal sealed class MacRfcommConnection : IRawConnection
     private async Task<bool> IsChannelOpenAsync(IntPtr channel)
         => await RunOnMainAsync(() => IsChannelOpen(channel));
 
-    private void WriteCurrentChannel(byte[] data)
+    // ===== 异步写入（writeAsync + 完成回调，绝不用 writeSync） =====
+
+    // 向指定通道写入数据并等待传输完成。写入派发到主线程（微秒级），
+    // 完成等待在后台线程进行；对端不读导致流控停顿时超时失败，绝不阻塞主线程。
+    private async Task WriteToChannelAsync(IntPtr channel, byte[] data, int timeoutMs, CancellationToken cancellationToken)
     {
-        IntPtr channel;
-        lock (_channelGate)
-            channel = _channel;
-        if (channel == IntPtr.Zero)
-            throw new IOException("The RFCOMM channel is not open.");
-        WriteRaw(channel, data);
+        await _writeSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            var buffer = Marshal.AllocHGlobal(data.Length);
+            Marshal.Copy(data, 0, buffer, data.Length);
+            // 完成等待者由调用方持有，避免与主线程完成回调竞争读取字段。
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await RunOnMainAsync(() => StartWrite(channel, buffer, (ushort)data.Length, completion));
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(timeoutMs);
+            try
+            {
+                await completion.Task.WaitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                // 超时：通道可能已卡死。缓冲区不在此处释放——IOBluetooth 可能仍持有该指针，
+                // 交由写完成回调释放；若回调永不到达则泄漏少量非托管内存（仅故障路径）。
+                throw new IOException("RFCOMM write timed out.");
+            }
+        }
+        finally
+        {
+            _writeSemaphore.Release();
+        }
+    }
+
+    // 主线程：发起异步写入。立即失败时就地释放缓冲区并完成等待者。
+    private void StartWrite(IntPtr channel, IntPtr buffer, ushort length, TaskCompletionSource completion)
+    {
+        _pendingWriteCompletion = completion;
+        _pendingWriteBuffer = buffer;
+        var status = ObjMsgSendWriteAsync(channel, WriteAsyncSelector, buffer, length, IntPtr.Zero);
+        if (status != KIoReturnSuccess)
+        {
+            ReleaseWriteBuffer();
+            completion.TrySetException(new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}."));
+        }
+    }
+
+    // 主线程委托回调：写入已交给硬件，释放缓冲区并唤醒等待者。
+    private void HandleWriteComplete(int status)
+    {
+        var completion = Interlocked.Exchange(ref _pendingWriteCompletion, null);
+        ReleaseWriteBuffer();
+        if (completion is null)
+            return;
+        if (status == KIoReturnSuccess)
+            completion.TrySetResult();
+        else
+            completion.TrySetException(new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}."));
+    }
+
+    private void ReleaseWriteBuffer()
+    {
+        var buffer = Interlocked.Exchange(ref _pendingWriteBuffer, IntPtr.Zero);
+        if (buffer != IntPtr.Zero)
+            Marshal.FreeHGlobal(buffer);
     }
 
     // 幂等收尾：关闭已打开的通道。委托对象永不 release——performSelectorOnMainThread
@@ -774,21 +847,6 @@ internal sealed class MacRfcommConnection : IRawConnection
     private static bool IsChannelOpen(IntPtr channel)
         => channel != IntPtr.Zero && ObjMsgSendBool(channel, IsOpenSelector) != 0;
 
-    private static void WriteRaw(IntPtr channel, byte[] data)
-    {
-        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
-        try
-        {
-            var status = ObjMsgSendWrite(channel, WriteSelector, handle.AddrOfPinnedObject(), (ushort)data.Length);
-            if (status != KIoReturnSuccess)
-                throw new IOException($"RFCOMM write failed: IOReturn=0x{status:X8}.");
-        }
-        finally
-        {
-            handle.Free();
-        }
-    }
-
     private static void CloseChannel(IntPtr channel)
     {
         try
@@ -835,6 +893,7 @@ internal sealed class MacRfcommConnection : IRawConnection
         class_addMethod(cls, SelRegisterName("rfcommChannelData:data:length:"), ChannelDataImp, "v@:@^vQ");
         class_addMethod(cls, SelRegisterName("rfcommChannelClosed:"), ChannelClosedImp, "v@:@");
         class_addMethod(cls, SelRegisterName("sdpQueryComplete:status:"), SdpCompleteImp, "v@:@i");
+        class_addMethod(cls, SelRegisterName("rfcommChannelWriteComplete:refcon:status:"), WriteCompleteImp, "v@:@^vi");
         class_addMethod(cls, SelRegisterName("runAction:"), MainInvokeImp, "v@:@");
         objc_registerClassPair(cls);
         return cls;
@@ -881,6 +940,19 @@ internal sealed class MacRfcommConnection : IRawConnection
         }
     }
 
+    private static void OnWriteComplete(IntPtr self, IntPtr selector, IntPtr channel, IntPtr refcon, int status)
+    {
+        try
+        {
+            if (Delegates.TryGetValue(self, out var connection))
+                connection.HandleWriteComplete(status);
+        }
+        catch (Exception exception)
+        {
+            ApplicationLog.Current?.Error("Bluetooth", "写入完成回调异常。", exception);
+        }
+    }
+
     private static void OnMainThreadInvoke(IntPtr self, IntPtr selector, IntPtr argument)
     {
         try
@@ -902,6 +974,9 @@ internal sealed class MacRfcommConnection : IRawConnection
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void RfcommSdpCompleteImp(IntPtr self, IntPtr selector, IntPtr device, int status);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void RfcommWriteCompleteImp(IntPtr self, IntPtr selector, IntPtr channel, IntPtr refcon, int status);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void RfcommMainInvokeImp(IntPtr self, IntPtr selector, IntPtr argument);
@@ -936,8 +1011,9 @@ internal sealed class MacRfcommConnection : IRawConnection
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
     private static extern int ObjMsgSendOpenChannel(IntPtr self, IntPtr selector, out IntPtr channel, byte channelId, IntPtr channelDelegate);
 
+    // writeAsync:length:refcon: —— 绝不用 writeSync（主线程嵌套 run loop 等 socket 可写会永久阻塞）。
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
-    private static extern int ObjMsgSendWrite(IntPtr self, IntPtr selector, IntPtr data, ushort length);
+    private static extern int ObjMsgSendWriteAsync(IntPtr self, IntPtr selector, IntPtr data, ushort length, IntPtr refcon);
 
     [DllImport(LibObjc, EntryPoint = "objc_msgSend")]
     private static extern int ObjMsgSendGetRfcommChannel(IntPtr self, IntPtr selector, out byte channel);

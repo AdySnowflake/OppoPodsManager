@@ -184,6 +184,8 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 1. **Obj-C 回调入口（`class_addMethod` 注册的 IMP）必须 try/catch 一切**：托管异常穿透到 Obj-C 运行时会破坏 run loop，直接 SIGSEGV。
 2. **作为 `performSelectorOnMainThread` receiver 的对象永不 release**：派发可能在主线程队列排队，release 即 use-after-free。
 3. **主线程只做微秒级调用，不做秒级等待**（见 §3.3）。
+4. **绝不用 `writeSync:length:`**：它内部会在主线程跑嵌套 run loop 等 socket 可写（`CFWriteStreamWrite → SocketStream::write → CFRunLoopRunSpecific → mach_msg`），对端不读数据时**永久阻塞主线程**（`sample` 实测：2483/2483 样本卡在此处，UI 全冻）。必须用 `writeAsync:length:refcon:` + `rfcommChannelWriteComplete:refcon:status:` 回调；缓冲区用非托管内存，由完成回调释放，等待放后台线程并设超时。
+5. **`openRFCOMMChannelSync` 暂用同步版**：数十次实测均快速返回（成功/失败都不阻塞）；若未来出现打开卡死，按第 4 条同样改造为 `openRFCOMMChannelAsync:`。
 | `CS0117: 'Path' does not contain a definition for 'Combine'` / `CS0103: 'Directory'/'File' does not exist` | `#if MACOS` 自启块用了裸 `System.IO` 调用。文件里 `Avalonia.Controls.Shapes.Path` 与 `System.IO.Path` 冲突，**不能**直接加 `using System.IO;`，须全限定 `System.IO.*`（文件既有惯例） |
 
 ### 运行期
@@ -193,6 +195,8 @@ clang -framework IOBluetooth -framework Foundation -o macos-rfcomm-probe tools/m
 | 发现 0 设备（日志无蓝牙记录） | `device_connected` 在 Darwin 24 是**数组**而非对象，解析按对象形态被跳过 | `system_profiler SPBluetoothDataType -json \| python3 -m json.tool` |
 | 所有通道 18ms 内瞬时全败（`kIOReturnError`） | 连接序列跑在 .NET 后台线程——SDP 回调不投递 + RFCOMM 打开要求主线程（§3.3） | C 原型线程对照实验（主/后台同通道对比） |
 | UI 卡死 4-6 秒/次 | 连接序列（含秒级等待）整体占主线程；控制层每品牌重试 | 日志时间戳（每次尝试间隔 4-6s） |
+| **UI 永久卡死（主线程 100% 占用）** | `writeSync:length:` 在主线程嵌套 run loop 里等 socket 可写，对端不读即永久阻塞（`mach_msg`） | `sample <pid> 3`：主线程栈停在 `-[IOBluetoothRFCOMMChannel writeSync:length:] → CFWriteStreamWrite → mach_msg` |
+| 所有通道打开返回 `0xE00002D6` (kIOReturnTimeout) | 耳机被反复探活后进入拒绝状态，需静置恢复 | C 原型逐通道打印 status |
 | **主线程 `performSelectorOnMainThread` 回调内 EXC_BAD_ACCESS（SIGSEGV）** | delegate 被 release 后派发仍在主线程队列中 → use-after-free | `~/Library/Logs/DiagnosticReports/*.ips`（崩溃线程 0，栈含 `__NSThreadPerformPerform`） |
 | 单通道探活写失败（`0xE00002CD` kIOReturnNotOpen）导致整个序列中止 | 异常直接穿透到序列 catch，未按“死通道”处理 | 日志堆栈 |
 | ch 11 打不开但 12/14/15 能开 | GAIA 会话被占用：手机 App 或本机 app 此前的连接未释放（对端会保留 DLC 一段时间） | 断开占用方 + 等待复测 |
