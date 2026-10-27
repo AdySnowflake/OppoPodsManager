@@ -4,7 +4,7 @@
 > 本文所有涉及 IOBluetooth 的结论均在 **macOS 15（Darwin 24）+ vivo TWS 4 + 第三方 USB 蓝牙加密狗**上实测验证（2026-10-27）。
 > 排查利器：`tools/macos-rfcomm-probe.c`（无 dotnet 环境下用 clang 直接验证 IOBluetooth 行为）。
 
-**当前状态**：端到端通信已验证打通（SDP 识别 GAIA 通道 → 打开 → 读电量成功，见 §5.2）；C# 侧已按同一逻辑实现，尚未经 app 真机确认。
+**当前状态**：✅ **端到端打通并经 app 真机确认**（2026-10-27）。vivo TWS 4 连接成功后：双耳电量实时显示（94%/96%）、佩戴状态、降噪控制（关闭/降噪/通透）、游戏模式、查找耳机均工作；设备列表可枚举多设备。修复过程见 §9。
 
 ---
 
@@ -140,7 +140,20 @@ SDP 查询完成 → 找到 GAIA 服务: ch 12 → 打开 status=0x00000000
 帧格式对照（`FF [ver] [flags] [len] [vendor_hi] [vendor_lo] [cmd_hi] [cmd_lo] [payload]`）：
 应答 `FF 03 00 05 00 1B 82 07 | 00 62 64 FF 00` = ver 3 / flags 0 / len 5 / vendor 0x001B(VIVO) / cmd 0x8207(电量应答) / payload 含两耳电量。
 
-### 5.3 历史探活数据（供比对）
+### 5.3 上游 Avalonia 托盘 bug（macOS 专属，已修）
+
+现象：日志被 `[App] UI 线程未处理异常` 刷爆（每次快照刷新一条）：
+
+```
+Avalonia.Native ... The menu being updated does not match. (Parameter 'menu')
+   at Avalonia.Controls.TrayIcon.set_Menu(NativeMenu value)
+```
+
+原因：`TrayIconController.RefreshMenu` 每次都用**新的** `NativeMenu` 实例赋给 `TrayIcon.Menu`，Avalonia.Native 的菜单导出器不接受替换整个实例（Windows/Linux 无此问题）。
+
+修复：`TrayIcon.Menu` 只分配一次，之后复用同一实例、清空重建 `Items`（`TrayMenu.Create` → `TrayMenu.Populate(NativeMenu, ...)`）。
+
+### 5.4 历史探活数据（供比对）
 
 ```
 打开 GAIA 通道后:

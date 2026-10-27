@@ -29,6 +29,7 @@ public sealed class TrayIconController : IDisposable
     private DispatcherTimer? _clickTimer;
     private StatusWindow? _miniWindow;
     private string _menuSignature = "";
+    private NativeMenu? _menu;
     private bool _disposed;
 
     public TrayIconController(
@@ -95,13 +96,20 @@ public sealed class TrayIconController : IDisposable
         if (!force && string.Equals(signature, _menuSignature, StringComparison.Ordinal))
             return;
 
-        _icon.Menu = TrayMenu.Create(
+        // macOS 上替换 TrayIcon.Menu 实例会触发 Avalonia.Native 的
+        // "The menu being updated does not match" 异常（实测每次刷新都抛、日志被
+        // 刷爆），因此 Menu 只分配一次，之后始终复用同一实例、清空重建其 Items。
+        _menu ??= new NativeMenu();
+        _menu.Items.Clear();
+        TrayMenu.Populate(
+            _menu,
             snapshot,
             ActiveDeviceManager,
             _commandDispatcher,
             ShowMainWindow,
             ToggleMiniWindow,
             ExitApplication);
+        _icon.Menu = _menu;
         _menuSignature = signature;
     }
 

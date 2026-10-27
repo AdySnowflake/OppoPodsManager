@@ -12,7 +12,12 @@ namespace OppoPodsManager.UI.Tray;
 // 构建托盘的最小常驻菜单，所有业务状态仍由主窗口和控制层维护。
 internal static class TrayMenu
 {
-    public static NativeMenu Create(
+    // 往传入的 NativeMenu 填充内容（不新建实例）。
+    // 注意：macOS 上替换 TrayIcon.Menu 实例会触发 Avalonia.Native 的
+    // "The menu being updated does not match" 异常（实测每次快照刷新都抛），
+    // 因此调用方必须复用同一 NativeMenu 实例、只清空重建其 Items。
+    public static void Populate(
+        NativeMenu menu,
         BusinessSnapshot snapshot,
         IBrandManager? manager,
         CommandDispatcher dispatcher,
@@ -20,7 +25,6 @@ internal static class TrayMenu
         Action showMiniWindow,
         Action exitApplication)
     {
-        var menu = new NativeMenu();
         if (snapshot.IsConnected && manager is not null)
         {
             AddDeviceControls(menu, snapshot, manager, dispatcher);
@@ -48,7 +52,6 @@ internal static class TrayMenu
             exitApplication();
         };
         menu.Add(exitItem);
-        return menu;
     }
 
     // 将原项目最常用的三个设备开关放入原生菜单，状态由最新快照回显。
